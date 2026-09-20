@@ -1,7 +1,7 @@
 import sqlite3
 from pathlib import Path
 from datetime import datetime,timezone
-
+import json 
 DATABASE_PATH = Path("data/database/edith.db")
 
 
@@ -25,6 +25,15 @@ def initialize_database():
         )
     """)
 
+    connection.execute("""
+    CREATE TABLE IF NOT EXISTS memory_vectors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id INTEGER NOT NULL,
+        embedding TEXT NOT NULL,
+        FOREIGN KEY (message_id) REFERENCES messages(id)
+    )
+""")
+
     columns = connection.execute(
         "PRAGMA table_info(messages)"
     ).fetchall()
@@ -46,7 +55,7 @@ def save_message(session_id: str, role: str, content: str):
         "%Y-%m-%d %H:%M:%S"
     )
 
-    connection.execute(
+    cursor = connection.execute(
         """
         INSERT INTO messages (session_id, role, content, created_at)
         VALUES (?, ?, ?, ?)
@@ -54,8 +63,16 @@ def save_message(session_id: str, role: str, content: str):
         (session_id, role, content, created_at),
     )
 
+    message_id = cursor.lastrowid
+
+    if message_id is None:
+        connection.close()
+        raise RuntimeError("Failed to retrieve inserted message ID")
+
     connection.commit()
     connection.close()
+
+    return message_id
 
 def load_messages():
     connection = get_connection()
@@ -108,6 +125,7 @@ def load_session_messages(session_id:str):
     return messages    
 
 def load_messages_between(start_time: str, end_time: str):
+
     connection = get_connection()
 
     cursor = connection.execute(
@@ -134,3 +152,43 @@ def load_messages_between(start_time: str, end_time: str):
     connection.close()
 
     return messages
+
+def save_embedding(message_id: int, embedding):
+    connection = get_connection()
+
+    embedding_json = json.dumps(embedding.tolist())
+
+    connection.execute(
+        """
+        INSERT INTO memory_vectors (message_id, embedding)
+        VALUES (?, ?)
+        """,
+        (message_id, embedding_json),
+    )
+
+    connection.commit()
+    connection.close()
+
+
+def load_embeddings():
+    connection = get_connection()
+
+    cursor = connection.execute(
+        """
+        SELECT message_id, embedding
+        FROM memory_vectors
+        ORDER BY id ASC
+        """
+    )
+
+    embeddings = []
+
+    for message_id, embedding_json in cursor.fetchall():
+        embeddings.append({
+            "message_id": message_id,
+            "embedding": json.loads(embedding_json),
+        })
+
+    connection.close()
+
+    return embeddings
