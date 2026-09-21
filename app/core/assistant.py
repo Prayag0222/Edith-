@@ -22,11 +22,17 @@ class EdithAssistant:
         )
 
     def respond(self, conversation, llm, user_input):
+        memory_context = conversation.memory_service.get_context(user_input)
+            
         conversation.add_user_message(user_input)
 
         messages = conversation.build_messages()
 
-        response = llm.generate(messages)
+        print("\n--- MEMORY CONTEXT ---")
+        print(memory_context)
+        print("----------------------\n")
+
+        response = llm.generate(messages,memory_context=memory_context)
 
         conversation.add_assistant_message(response)
 

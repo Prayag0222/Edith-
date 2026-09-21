@@ -22,11 +22,17 @@ class OllamaClient:
         except urllib.error.URLError:
             return False
 
-    def generate(self, messages: list[dict]) -> str:
+    def generate(self, messages: list[dict],memory_context:str = "") -> str:
         url = f"{self.base_url}/api/chat"
 
         identity = self.edith.get_identity()
         self_description = self.edith.get_self_description()
+
+        if memory_context:memory_section=f"""
+        RELEVENT MEMORY
+        {memory_context}
+        """
+        else:memory_section=""
 
         system_message = f"""
 {EDITH_IDENTITY}
@@ -38,6 +44,8 @@ Administrator: {identity["administrator"]}
 
 DITH's own self-description:
 {self_description}
+
+{memory_section}
 
 COMMUNICATION RULES:
 - You are EDITH, speaking directly to Prayag.

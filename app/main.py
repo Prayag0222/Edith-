@@ -1,11 +1,13 @@
 from app.llm.client import OllamaClient
 from app.conversation.service import ConversationService
 from app.core.assistant import EdithAssistant
+from app.memory.service import MemoryService
 
 def main():
     edith = EdithAssistant()
     llm = OllamaClient(edith)
-    conversation = ConversationService()
+    memory = MemoryService()
+    conversation = ConversationService(memory)
 
     if llm.is_available():
         print("EDITH is ready ")

@@ -79,7 +79,7 @@ def load_messages():
 
     cursor = connection.execute(
         """
-        SELECT session_id, role, content, created_at
+        SELECT id,session_id, role, content, created_at
         FROM messages
         ORDER BY id ASC
         """
@@ -87,8 +87,9 @@ def load_messages():
 
     messages = []
 
-    for session_id, role, content, created_at in cursor.fetchall():
+    for message_id, session_id, role, content, created_at in cursor.fetchall():
         messages.append({
+            "id": message_id,
             "session_id": session_id,
             "role": role,
             "content": content,
@@ -130,7 +131,7 @@ def load_messages_between(start_time: str, end_time: str):
 
     cursor = connection.execute(
         """
-        SELECT session_id, role, content, created_at
+        SELECT id,session_id, role, content, created_at
         FROM messages
         WHERE created_at >= ?
         AND created_at <= ?
@@ -141,8 +142,9 @@ def load_messages_between(start_time: str, end_time: str):
 
     messages = []
 
-    for session_id, role, content, created_at in cursor.fetchall():
+    for message_id, session_id, role, content, created_at in cursor.fetchall():
         messages.append({
+            "id": message_id,
             "session_id": session_id,
             "role": role,
             "content": content,
@@ -192,3 +194,47 @@ def load_embeddings():
     connection.close()
 
     return embeddings
+
+
+def delete_embedding(message_id: int):
+    connection = get_connection()
+
+    connection.execute(
+        """
+        DELETE FROM memory_vectors
+        WHERE message_id = ?
+        """,
+        (message_id,),
+    )
+
+    connection.commit()
+    connection.close()
+
+
+
+def load_message(message_id: int):
+    connection = get_connection()
+
+    cursor = connection.execute(
+        """
+        SELECT id, session_id, role, content, created_at
+        FROM messages
+        WHERE id = ?
+        """,
+        (message_id,),
+    )
+
+    row = cursor.fetchone()
+
+    connection.close()
+
+    if row is None:
+        return None
+
+    return {
+        "id": row[0],
+        "session_id": row[1],
+        "role": row[2],
+        "content": row[3],
+        "created_at": row[4],
+    }
