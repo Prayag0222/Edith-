@@ -1,16 +1,16 @@
 import uuid
 
-from app.memory.database import (
-    initialize_database,
-    save_message,
-)
+from app.memory.service import MemoryService
 
 
 class ConversationService:
-    def __init__(self):
+    def __init__(self, memory_service=None):
         self.session_id = str(uuid.uuid4())
 
-        initialize_database()
+        self.memory_service = (
+            memory_service
+            or MemoryService()
+        )
 
         self.max_messages = 20
         self.messages = []
@@ -21,7 +21,7 @@ class ConversationService:
             "content": content,
         })
 
-        save_message(
+        self.memory_service.store_message(
             self.session_id,
             "user",
             content,
@@ -35,7 +35,7 @@ class ConversationService:
             "content": content,
         })
 
-        save_message(
+        self.memory_service.store_message(
             self.session_id,
             "assistant",
             content,
