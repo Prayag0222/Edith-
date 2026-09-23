@@ -1,22 +1,27 @@
 import numpy as np
 from sentence_transformers import util
-from app.memory.database import (
-    load_messages,
-    load_message,
+from app.memory.vector_store import (
+
     load_embeddings,
     save_embedding,
+   
+)
+
+from app.memory.message_store import (
+    load_messages,
+    load_message,
     load_messages_between
 )
 
 from app.memory.embeddings import EmbeddingService
 
-from app.memory.database import load_embeddings
+from app.memory.vector_store import load_embeddings
 
 
 def search_similar_memories(
     query_embedding,
     top_k: int = 5,
-    min_score:float = 0.3,
+    min_score:float = 0.45,
 ):
     stored_embeddings = load_embeddings()
 
@@ -72,7 +77,7 @@ def search_messages_in_range(
     end_time: str,
     embedding_service: EmbeddingService,
     top_k: int = 5,
-    min_score: float = 0.30,
+    min_score: float = 0.45,
 ):
     messages = load_messages_between(
         start_time,
@@ -134,7 +139,7 @@ def search_memory(
     text: str,
     embedding_service: EmbeddingService ,
     top_k: int = 5,
-    min_score: float = 0.30,
+    min_score: float = 0.45 ,
 ):
 
     query_embedding = embedding_service.encode(text)

@@ -34,6 +34,17 @@ def initialize_database():
     )
 """)
 
+    connection.execute("""
+    CREATE TABLE IF NOT EXISTS structured_memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
     columns = connection.execute(
         "PRAGMA table_info(messages)"
     ).fetchall()
@@ -48,193 +59,5 @@ def initialize_database():
     connection.commit()
     connection.close()
 
-def save_message(session_id: str, role: str, content: str):
-    connection = get_connection()
-
-    created_at = datetime.now(timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    cursor = connection.execute(
-        """
-        INSERT INTO messages (session_id, role, content, created_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (session_id, role, content, created_at),
-    )
-
-    message_id = cursor.lastrowid
-
-    if message_id is None:
-        connection.close()
-        raise RuntimeError("Failed to retrieve inserted message ID")
-
-    connection.commit()
-    connection.close()
-
-    return message_id
-
-def load_messages():
-    connection = get_connection()
-
-    cursor = connection.execute(
-        """
-        SELECT id,session_id, role, content, created_at
-        FROM messages
-        ORDER BY id ASC
-        """
-    )
-
-    messages = []
-
-    for message_id, session_id, role, content, created_at in cursor.fetchall():
-        messages.append({
-            "id": message_id,
-            "session_id": session_id,
-            "role": role,
-            "content": content,
-            "created_at": created_at,
-        })
-
-    connection.close()
-
-    return messages
 
 
-def load_session_messages(session_id:str):
-    connection = get_connection()
-
-    cursor = connection.execute("""
-    SELECT session_id, role,content, created_at
-    FROM messages
-    WHERE session_id = ?
-    ORDER BY id ASC
-    """, (session_id,),)
-
-    messages = []
-
-    for session_id, role, content, created_at in cursor.fetchall():
-        messages.append({
-            "session_id": session_id,
-            "role": role,
-            "content": content,
-            "created_at": created_at,
-        })
-
-    connection.close()
-
-    return messages    
-
-def load_messages_between(start_time: str, end_time: str):
-
-    connection = get_connection()
-
-    cursor = connection.execute(
-        """
-        SELECT id,session_id, role, content, created_at
-        FROM messages
-        WHERE created_at >= ?
-        AND created_at <= ?
-        ORDER BY id ASC
-        """,
-        (start_time, end_time),
-    )
-
-    messages = []
-
-    for message_id, session_id, role, content, created_at in cursor.fetchall():
-        messages.append({
-            "id": message_id,
-            "session_id": session_id,
-            "role": role,
-            "content": content,
-            "created_at": created_at,
-        })
-
-    connection.close()
-
-    return messages
-
-def save_embedding(message_id: int, embedding):
-    connection = get_connection()
-
-    embedding_json = json.dumps(embedding.tolist())
-
-    connection.execute(
-        """
-        INSERT INTO memory_vectors (message_id, embedding)
-        VALUES (?, ?)
-        """,
-        (message_id, embedding_json),
-    )
-
-    connection.commit()
-    connection.close()
-
-
-def load_embeddings():
-    connection = get_connection()
-
-    cursor = connection.execute(
-        """
-        SELECT message_id, embedding
-        FROM memory_vectors
-        ORDER BY id ASC
-        """
-    )
-
-    embeddings = []
-
-    for message_id, embedding_json in cursor.fetchall():
-        embeddings.append({
-            "message_id": message_id,
-            "embedding": json.loads(embedding_json),
-        })
-
-    connection.close()
-
-    return embeddings
-
-
-def delete_embedding(message_id: int):
-    connection = get_connection()
-
-    connection.execute(
-        """
-        DELETE FROM memory_vectors
-        WHERE message_id = ?
-        """,
-        (message_id,),
-    )
-
-    connection.commit()
-    connection.close()
-
-
-
-def load_message(message_id: int):
-    connection = get_connection()
-
-    cursor = connection.execute(
-        """
-        SELECT id, session_id, role, content, created_at
-        FROM messages
-        WHERE id = ?
-        """,
-        (message_id,),
-    )
-
-    row = cursor.fetchone()
-
-    connection.close()
-
-    if row is None:
-        return None
-
-    return {
-        "id": row[0],
-        "session_id": row[1],
-        "role": row[2],
-        "content": row[3],
-        "created_at": row[4],
-    }

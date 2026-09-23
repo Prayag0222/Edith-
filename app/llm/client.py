@@ -4,7 +4,7 @@ import urllib.request
 
 from app.core.config import settings
 from app.core.identity import EDITH_IDENTITY
-
+from app.core.behavior import EDITH_BEHAVIOR
 
 class OllamaClient:
     def __init__(self, edith, model: str | None = None):
@@ -35,14 +35,15 @@ class OllamaClient:
         else:memory_section=""
 
         system_message = f"""
-{EDITH_IDENTITY}
+{EDITH_IDENTITY} 
+{EDITH_BEHAVIOR}
 
 Current EDITH identity:
 Name: {identity["name"]}
 Creator: {identity["creator"]}
 Administrator: {identity["administrator"]}
 
-DITH's own self-description:
+EDITH's own self-description:
 {self_description}
 
 {memory_section}

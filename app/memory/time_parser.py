@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from app.memory.database import load_messages_between
+from app.memory.message_store import load_messages_between
 
 
 LOCAL_TIMEZONE = ZoneInfo("Asia/Kolkata")
