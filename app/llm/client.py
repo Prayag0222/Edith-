@@ -6,6 +6,7 @@ from app.core.config import settings
 from app.core.identity import EDITH_IDENTITY
 from app.core.behavior import EDITH_BEHAVIOR
 
+
 class OllamaClient:
     def __init__(self, edith, model: str | None = None):
         self.edith = edith
@@ -18,53 +19,81 @@ class OllamaClient:
         try:
             with urllib.request.urlopen(url, timeout=2):
                 return True
-
-        except urllib.error.URLError:
+        except (urllib.error.URLError, TimeoutError):
             return False
 
-    def generate(self, messages: list[dict],memory_context:str = "") -> str:
+    def generate(
+        self,
+        messages: list[dict],
+        memory_context: str = "",
+    ) -> str:
         url = f"{self.base_url}/api/chat"
 
         identity = self.edith.get_identity()
         self_description = self.edith.get_self_description()
 
-        if memory_context:memory_section=f"""
-        RELEVENT MEMORY
-        {memory_context}
-        """
-        else:memory_section=""
+        if memory_context.strip():
+            memory_section = f"""
+AVAILABLE MEMORY CONTEXT
+
+The following information was retrieved from EDITH's memory.
+Use it when relevant to the user's question.
+
+{memory_context}
+
+MEMORY RULES:
+
+* If the user asks about previous conversations, examine the available
+  historical records before answering.
+* If historical records for the requested date are present, summarize
+  those records directly.
+* Use speaker labels to distinguish what Prayag said from what EDITH said.
+* Do not claim that previous conversations are inaccessible when relevant
+  records are included above.
+* Do not invent events, decisions, or tasks that the records do not support.
+* If the records are incomplete, clearly distinguish known details from
+  missing information.
+"""
+        else:
+            memory_section = """
+AVAILABLE MEMORY CONTEXT
+
+No memory context was provided for this request.
+Do not claim to have retrieved memories or invent past conversations.
+"""
 
         system_message = f"""
-{EDITH_IDENTITY} 
+{EDITH_IDENTITY}
+
 {EDITH_BEHAVIOR}
 
-Current EDITH identity:
+CURRENT IDENTITY
 Name: {identity["name"]}
 Creator: {identity["creator"]}
 Administrator: {identity["administrator"]}
 
-EDITH's own self-description:
+SELF-DESCRIPTION
 {self_description}
 
 {memory_section}
 
-COMMUNICATION RULES:
-- You are EDITH, speaking directly to Prayag.
-- When referring to yourself, use first-person language: "I", "me", "my".
-- When referring to Prayag, use second-person language: "you", "your".
-- Never confuse EDITH's identity with Prayag's identity.
-- If asked about yourself, describe yourself as EDITH.
-- Respond naturally and conversationally rather than like a command system.
+COMMUNICATION RULES
+
+* Speak directly to Prayag.
+* Refer to yourself as "I", "me", or "my".
+* Refer to Prayag as "you" or "your".
+* Never confuse your identity with Prayag's identity.
+* Do not claim an action was completed unless it was actually executed.
+* Respond naturally, clearly, and directly.
 """
 
         chat_messages = [
             {
                 "role": "system",
                 "content": system_message,
-            }
+            },
+            *messages,
         ]
-
-        chat_messages.extend(messages)
 
         data = {
             "model": self.model,
@@ -80,10 +109,14 @@ COMMUNICATION RULES:
         )
 
         try:
-            with urllib.request.urlopen(request) as response:
+            with urllib.request.urlopen(request, timeout=120) as response:
                 result = json.loads(response.read().decode("utf-8"))
 
-            return result["message"]["content"]
+            content = result.get("message", {}).get("content", "")
+            return content.strip() or "I couldn't generate a response."
 
-        except urllib.error.URLError:
+        except (urllib.error.URLError, TimeoutError):
             return "My local AI engine is currently unavailable."
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return "I encountered an error processing the local AI response."
+
