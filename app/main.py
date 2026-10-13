@@ -1,14 +1,21 @@
-from urllib import response
+import re
 
 from app.llm.client import OllamaClient
 from app.conversation.service import ConversationService
 from app.core.assistant import EdithAssistant
 from app.memory.service import MemoryService
 from app.memory.manager import MemoryManager
-from app.voice import tts
 from app.voice.stt import SpeechToText
 from app.voice.tts import TextToSpeech
 from app.voice.wake_word import WakeWordDetector
+from time import perf_counter
+
+
+def is_exit_command(text: str) -> bool:
+    """Recognize exit commands despite capitalization or punctuation."""
+    normalized = re.sub(r"[^\w\s]", "", text.casefold()).strip()
+    return normalized == "exit"
+
 
 def main():
     edith = EdithAssistant()
@@ -23,47 +30,65 @@ def main():
     wake_word = WakeWordDetector()
 
     if llm.is_available():
-        print("EDITH is ready ")
-        print(" Local engine AI is: Online\n")
+        print("EDITH is ready — Local AI: Online\n")
     else:
-        print("EDITH is ready ")
-        print(" Local engine AI is: Offline\n")
+        print("EDITH is ready — Local AI: Offline\n")
 
     print("Type 'exit' to stop.\n")
 
     while True:
-        print("Waiting for wake word...")
+        print("[READY] Waiting for wake word...")
+        print("[DEBUG] Wake-word detector starting...")
 
-        wake_word.wait_for_wake_word()
+        wake_detected = wake_word.wait_for_wake_word()
 
-        print("Wake word detected!")
-        print("Listening...")
+        print(f"[DEBUG] Wake-word detector returned: {wake_detected}")
 
-        result = stt.listen()
-
-        if result is None:
+        if not wake_detected:
             continue
 
-        user_input = result["text"].strip()
-        print(f"You: {user_input}")
+        print("[WAKE] Wake word detected.")
 
-        if user_input.lower() == "exit":
-            print("EDITH: Goodbye.")
-            break
+        # Keep listening until the conversation times out or EDITH exits.
+        while True:
+            print("[LISTEN] Listening...")
 
-        if not user_input:
-            continue
+            result = stt.listen()
 
-        response = edith.respond(
-            conversation,
-            llm,
-            memory_manager,
-            user_input,
-        )
+            if result is None:
+                print("[SLEEP] Conversation timed out. Waiting for wake word.\n")
+                break
 
-        print(f"EDITH: {response}\n")
-        tts.speak(response)
+            user_input = result.get("text", "").strip()
 
+            if not user_input:
+                continue
+
+            print(f"You: {user_input}")
+
+            if is_exit_command(user_input):
+                print("EDITH: Goodbye.")
+                tts.speak("Goodbye.")
+                return
+
+            print("[THINK] Thinking...")
+
+            response_start = perf_counter()
+
+            response = edith.respond(
+                conversation,
+                llm,
+                memory_manager,
+                user_input,
+            )
+
+            print(
+                f"[TIME] Total response processing: "
+                f"{perf_counter() - response_start:.2f}s\n"
+            )
+
+            print(f"EDITH: {response}\n")
+            tts.speak(response)
 
 if __name__ == "__main__":
     main()

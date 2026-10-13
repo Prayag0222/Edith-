@@ -1,17 +1,17 @@
-from faster_whisper import WhisperModel
-
-
 class WhisperModelManager:
     """
     Manages Whisper model loading and caching.
 
-    Available configurations:
+    Models:
 
         CPU:
             small + int8
 
         GPU:
             medium + float16
+
+    Whisper and Faster-Whisper are imported lazily so that
+    EDITH does not initialize the Whisper stack during startup.
     """
 
     def __init__(self):
@@ -22,15 +22,15 @@ class WhisperModelManager:
         """
         Return the cached CPU Whisper model.
 
-        If it hasn't been loaded yet, load it first.
+        The model is loaded only when it is first requested.
         """
 
         if self.cpu_model is not None:
             return self.cpu_model
 
-        print(
-            "\nLoading Whisper model 'small' using CPU..."
-        )
+        from faster_whisper import WhisperModel
+
+        print("[STT] Loading small model on CPU...")
 
         self.cpu_model = WhisperModel(
             "small",
@@ -38,9 +38,7 @@ class WhisperModelManager:
             compute_type="int8",
         )
 
-        print(
-            "Whisper STT: CPU small model ready"
-        )
+        print("[STT] CPU small model ready.")
 
         return self.cpu_model
 
@@ -48,15 +46,15 @@ class WhisperModelManager:
         """
         Return the cached GPU Whisper model.
 
-        If it hasn't been loaded yet, load it first.
+        The model is loaded only when it is first requested.
         """
 
         if self.gpu_model is not None:
             return self.gpu_model
 
-        print(
-            "\nLoading Whisper model 'medium' using CUDA..."
-        )
+        from faster_whisper import WhisperModel
+
+        print("[STT] Loading medium model on CUDA...")
 
         self.gpu_model = WhisperModel(
             "medium",
@@ -64,8 +62,14 @@ class WhisperModelManager:
             compute_type="float16",
         )
 
-        print(
-            "Whisper STT: CUDA medium model ready"
-        )
+        print("[STT] CUDA medium model ready.")
 
-        return self.gpu_model   
+        return self.gpu_model
+
+    def is_cpu_model_loaded(self) -> bool:
+        """Return True if the CPU model is already loaded."""
+        return self.cpu_model is not None
+
+    def is_gpu_model_loaded(self) -> bool:
+        """Return True if the GPU model is already loaded."""
+        return self.gpu_model is not None

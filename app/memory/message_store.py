@@ -89,7 +89,7 @@ def load_messages_between(start_time: str, end_time: str):
         SELECT id,session_id, role, content, created_at
         FROM messages
         WHERE created_at >= ?
-        AND created_at <= ?
+        AND created_at < ?
         ORDER BY id ASC
         """,
         (start_time, end_time),

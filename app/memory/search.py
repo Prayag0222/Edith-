@@ -1,122 +1,48 @@
 import numpy as np
 from sentence_transformers import util
-from app.memory.vector_store import (
 
-    load_embeddings,
-    save_embedding,
-   
-)
-
+from app.memory.vector_store import load_embeddings, save_embedding
 from app.memory.message_store import (
     load_messages,
     load_message,
-    load_messages_between
+    load_messages_between,
 )
-
 from app.memory.embeddings import EmbeddingService
-
-from app.memory.vector_store import load_embeddings
 
 
 def search_similar_memories(
     query_embedding,
     top_k: int = 5,
-    min_score:float = 0.45,
+    min_score: float = 0.30,
 ):
     stored_embeddings = load_embeddings()
 
-    if not stored_embeddings:
+    if not stored_embeddings or top_k <= 0:
         return []
 
-    vectors = np.array([
-        item["embedding"]
-        for item in stored_embeddings
-    ],
+    vectors = np.asarray(
+        [item["embedding"] for item in stored_embeddings],
+        dtype=np.float32,
+    )
 
-    dtype=np.float32)
+    query_vector = np.asarray(
+        query_embedding,
+        dtype=np.float32,
+    )
 
-    query_vector = np.array(query_embedding,dtype=np.float32)
-
-    scores = util.cos_sim(
-        query_vector,
-        vectors,
-    )[0]
-
+    scores = util.cos_sim(query_vector, vectors)[0]
     results = []
 
     for index, score in enumerate(scores):
-      message_id = stored_embeddings[index]["message_id"]
-      message = load_message(message_id)
-
-      if message is None:
-          continue 
-
-      score_value = float(score)
-
-      if score_value < min_score:
-          continue
-
-      results.append({
-           "message_id": message_id,
-        "score": float(score),
-        "role": message["role"],
-        "content": message["content"],
-        "created_at": message["created_at"],
-      })
-    results.sort(
-        key=lambda item: item["score"],
-        reverse=True,
-    )
-
-    return results[:top_k]
-
-
-def search_messages_in_range(
-    text: str,
-    start_time: str,
-    end_time: str,
-    embedding_service: EmbeddingService,
-    top_k: int = 5,
-    min_score: float = 0.45,
-):
-    messages = load_messages_between(
-        start_time,
-        end_time,
-    )
-
-    if not messages:
-        return []
-
-    query_embedding = embedding_service.encode(text)
-
-    stored_embeddings = load_embeddings()
-
-    embedding_map = {
-        item["message_id"]: item["embedding"]
-        for item in stored_embeddings
-    }
-
-    results = []
-
-    for message in messages:
-        message_id = message.get("id")
-
-        if message_id is None:
-            continue
-
-        stored_embedding = embedding_map.get(message_id)
-
-        if stored_embedding is None:
-            continue
-
-        score = util.cos_sim(
-            np.array(query_embedding, dtype=np.float32),
-            np.array(stored_embedding, dtype=np.float32),
-        )[0][0]
-
         score_value = float(score)
 
         if score_value < min_score:
+            continue
+
+        message_id = stored_embeddings[index]["message_id"]
+        message = load_message(message_id)
+
+        if message is None:
             continue
 
         results.append({
@@ -135,13 +61,64 @@ def search_messages_in_range(
 
     return results[:top_k]
 
+
+def _select_balanced_messages(messages, top_k: int):
+    """Select messages distributed across the complete time range."""
+
+    if top_k <= 0:
+        return []
+
+    if len(messages) <= top_k:
+        return messages
+
+    if top_k == 1:
+        return [messages[len(messages) // 2]]
+
+    indices = [
+        round(index * (len(messages) - 1) / (top_k - 1))
+        for index in range(top_k)
+    ]
+
+    return [messages[index] for index in indices]
+
+
+def search_messages_in_range(
+    text: str,
+    start_time: str,
+    end_time: str,
+    embedding_service: EmbeddingService,
+    top_k: int = 20,
+    min_score: float = 0.30,
+):
+    messages = load_messages_between(
+        start_time,
+        end_time,
+    )
+
+    selected_messages = _select_balanced_messages(
+        messages,
+        top_k,
+    )
+
+    return [
+        {
+            "message_id": message["id"],
+            "score": 1.0,
+            "role": message["role"],
+            "content": message["content"],
+            "created_at": message["created_at"],
+            "session_id": message["session_id"],
+        }
+        for message in selected_messages
+    ]
+
+
 def search_memory(
     text: str,
-    embedding_service: EmbeddingService ,
+    embedding_service: EmbeddingService,
     top_k: int = 5,
-    min_score: float = 0.45 ,
+    min_score: float = 0.30,
 ):
-
     query_embedding = embedding_service.encode(text)
 
     return search_similar_memories(
@@ -149,8 +126,6 @@ def search_memory(
         top_k=top_k,
         min_score=min_score,
     )
-
-
 
 
 def index_messages():
@@ -164,7 +139,6 @@ def index_messages():
     }
 
     messages = load_messages()
-
     indexed_count = 0
 
     for message in messages:

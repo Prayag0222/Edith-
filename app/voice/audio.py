@@ -29,6 +29,8 @@ class AudioRecorder:
         silence_duration: float = 1.5,
         max_recording_seconds: float = 20.0,
         vad_aggressiveness: int = 2,
+        initial_silence_timeout: float = 8.0,
+
     ):
         self.sample_rate = sample_rate
         self.channels = channels
@@ -37,6 +39,7 @@ class AudioRecorder:
         self.max_recording_seconds = (
             max_recording_seconds
         )
+        self.initial_silence_timeout = initial_silence_timeout
 
         self.vad = VoiceActivityDetector(
             sample_rate=self.sample_rate,
@@ -338,6 +341,11 @@ class AudioRecorder:
             / block_duration
         )
 
+        initial_silence_blocks = int(
+            self.initial_silence_timeout
+            / block_duration
+        )
+
         # 500 ms pre-buffer.
         #
         # This protects the beginning of words.
@@ -361,7 +369,7 @@ class AudioRecorder:
             blocksize=block_size,
         ) as stream:
 
-            for _ in range(max_blocks):
+            for block_index in range(max_blocks):
 
                 audio_chunk, overflowed = (
                     stream.read(
@@ -414,6 +422,11 @@ class AudioRecorder:
                         )
 
                         silent_blocks = 0
+
+                    elif block_index + 1 >= initial_silence_blocks:
+                        print("[STT] Initial silence timeout.")
+                        return None
+
 
                     continue
 

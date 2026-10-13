@@ -3,6 +3,9 @@ import subprocess
 import sys
 import tempfile
 import winsound
+from time import perf_counter
+
+from matplotlib.pylab import rint
 
 
 class TextToSpeech:
@@ -12,6 +15,7 @@ class TextToSpeech:
     def speak(self, text: str):
         if not text or not text.strip():
             return
+        total_start = perf_counter()
 
         with tempfile.NamedTemporaryFile(
             suffix=".wav",
@@ -20,6 +24,8 @@ class TextToSpeech:
             output_path = temp_file.name
 
         try:
+            generation_start = perf_counter()
+
             subprocess.run(
                 [
                     sys.executable,
@@ -36,11 +42,17 @@ class TextToSpeech:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            
+            print(f"[TIME] TTS generation: {perf_counter() - generation_start:.2f}s")
 
+            playback_start = perf_counter()
             winsound.PlaySound(
                 output_path,
                 winsound.SND_FILENAME,
             )
+
+            print(f"[TIME] TTS playback: {perf_counter() - playback_start:.2f}s")
+            print(f"[TIME] Total TTS: {perf_counter() - total_start:.2f}s")
 
         finally:
             if os.path.exists(output_path):
