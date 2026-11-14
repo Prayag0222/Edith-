@@ -22,12 +22,11 @@ class OllamaClient:
         except (urllib.error.URLError, TimeoutError):
             return False
 
-    def generate(
+    def _build_messages(
         self,
         messages: list[dict],
         memory_context: str = "",
-    ) -> str:
-        url = f"{self.base_url}/api/chat"
+    ) -> list[dict]:
 
         identity = self.edith.get_identity()
         self_description = self.edith.get_self_description()
@@ -43,16 +42,13 @@ Use it when relevant to the user's question.
 
 MEMORY RULES:
 
-* If the user asks about previous conversations, examine the available
-  historical records before answering.
-* If historical records for the requested date are present, summarize
-  those records directly.
-* Use speaker labels to distinguish what Prayag said from what EDITH said.
-* Do not claim that previous conversations are inaccessible when relevant
-  records are included above.
-* Do not invent events, decisions, or tasks that the records do not support.
-* If the records are incomplete, clearly distinguish known details from
-  missing information.
+* Memory is supporting context, not the answer itself.
+* Identify what the user is actually asking before retrieving information.
+* Use relevant memories to answer the question directly.
+* Do not repeat identity information unless the user asks about identity.
+* When asked about previous conversations, summarize relevant historical records.
+* Distinguish known information from missing information.
+* Never invent events, decisions, or personal details.
 """
         else:
             memory_section = """
@@ -87,7 +83,7 @@ COMMUNICATION RULES
 * Respond naturally, clearly, and directly.
 """
 
-        chat_messages = [
+        return [
             {
                 "role": "system",
                 "content": system_message,
@@ -95,10 +91,28 @@ COMMUNICATION RULES
             *messages,
         ]
 
+    def generate_stream(
+        self,
+        messages: list[dict],
+        memory_context: str = "",
+    ):
+        """
+        Generate an AI response incrementally.
+
+        Yields text chunks as soon as Ollama produces them.
+        """
+
+        url = f"{self.base_url}/api/chat"
+
+        chat_messages = self._build_messages(
+            messages,
+            memory_context,
+        )
+
         data = {
             "model": self.model,
             "messages": chat_messages,
-            "stream": False,
+            "stream": True,
         }
 
         request = urllib.request.Request(
@@ -108,15 +122,61 @@ COMMUNICATION RULES
             method="POST",
         )
 
-        try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                result = json.loads(response.read().decode("utf-8"))
+        received_content = False
 
-            content = result.get("message", {}).get("content", "")
-            return content.strip() or "I couldn't generate a response."
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=120,
+            ) as response:
+
+                for line in response:
+                    if not line.strip():
+                        continue
+
+                    try:
+                        result = json.loads(line.decode("utf-8"))
+                    except json.JSONDecodeError:
+                        continue
+
+                    if "error" in result:
+                        raise RuntimeError(result["error"])
+
+                    content = result.get(
+                        "message", {}
+                    ).get("content", "")
+
+                    if content:
+                        received_content = True
+                        yield content
+
+                    if result.get("done", False):
+                        break
+
+            if not received_content:
+                yield "I couldn't generate a response."
 
         except (urllib.error.URLError, TimeoutError):
-            return "My local AI engine is currently unavailable."
-        except (json.JSONDecodeError, KeyError, TypeError):
-            return "I encountered an error processing the local AI response."
+            if not received_content:
+                yield "My local AI engine is currently unavailable."
 
+        except (RuntimeError, json.JSONDecodeError, KeyError, TypeError):
+            if not received_content:
+                yield "I encountered an error processing the local AI response."
+
+    def generate(
+        self,
+        messages: list[dict],
+        memory_context: str = "",
+    ) -> str:
+        """
+        Backward-compatible method.
+        Collects streamed chunks into a complete response.
+        """
+
+        return "".join(
+            self.generate_stream(
+                messages,
+                memory_context,
+            )
+        ).strip()
