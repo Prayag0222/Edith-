@@ -1,5 +1,4 @@
 from app.core.identity import EDITH_IDENTITY
-from time import perf_counter
 
 
 class EdithAssistant:
@@ -18,35 +17,58 @@ class EdithAssistant:
 
     def get_self_description(self):
         return (
-            f"I am {self.name}, a personal AI assistant ."
-            f" I was created and administered by {self.creator}. "
+            f"I am {self.name}, a personal AI assistant."
+            f" I was created and administered by {self.creator}."
         )
 
-    def respond(self, conversation, llm, memory_manager, user_input):
-        total_start = perf_counter()
+    def respond_stream(
+        self,
+        conversation,
+        llm,
+        memory_manager,
+        user_input,
+    ):
+        conversation.wait_for_persistence()
+        memory_context = conversation.memory_service.get_context(
+            user_input
+        )
 
-        # 1. Extract and save structured memories.
-        start = perf_counter()
-        saved_memories = memory_manager.process_message(user_input)
-        print(f"[TIME] Memory extraction: {perf_counter() - start:.2f}s")
-
-        # 2. Retrieve relevant memories.
-        start = perf_counter()
-        memory_context = conversation.memory_service.get_context(user_input)
-        print(f"[TIME] Memory retrieval: {perf_counter() - start:.2f}s")
-
-        # 3. Add the user message and prepare conversation history.
         conversation.add_user_message(user_input)
         messages = conversation.build_messages()
 
-        # 4. Generate the response.
-        start = perf_counter()
-        response = llm.generate(messages, memory_context=memory_context)
-        print(f"[TIME] LLM generation: {perf_counter() - start:.2f}s")
+        response_parts = []
 
-        # 5. Save the assistant response.
-        conversation.add_assistant_message(response)
+        try:
+            for chunk in llm.generate_stream(
+                messages,
+                memory_context=memory_context,
+            ):
+                if chunk:
+                    response_parts.append(chunk)
+                    yield chunk
+        finally:
+            conversation.process_user_memory(
+                user_input,
+                memory_manager,
+            )
 
-        print(f"[TIME] Total response processing: {perf_counter() - total_start:.2f}s")
+        response = "".join(response_parts).strip()
 
-        return response
+        if response:
+            conversation.add_assistant_message(response)
+
+    def respond(
+        self,
+        conversation,
+        llm,
+        memory_manager,
+        user_input,
+    ):
+        return "".join(
+            self.respond_stream(
+                conversation,
+                llm,
+                memory_manager,
+                user_input,
+            )
+        ).strip()

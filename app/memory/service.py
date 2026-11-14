@@ -8,6 +8,56 @@ from app.memory.time_parser import get_time_range
 from app.memory.message_store import save_message
 from app.memory.structured_service import StructuredMemoryService
 
+
+_MEMORY_QUERY_STOP_WORDS = {
+    "about",
+    "and",
+    "are",
+    "did",
+    "does",
+    "for",
+    "from",
+    "have",
+    "how",
+    "into",
+    "is",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "our",
+    "please",
+    "say",
+    "tell",
+    "the",
+    "to",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "you",
+    "your",
+}
+
+
+def _memory_terms(text: str) -> set[str]:
+    normalized = "".join(
+        character.casefold() if character.isalnum() else " "
+        for character in text
+    )
+    return {
+        word
+        for word in normalized.split()
+        if len(word) > 2 and word not in _MEMORY_QUERY_STOP_WORDS
+    }
+
+
 class MemoryService:
     def __init__(self):
         self.embedding_service = EmbeddingService()
@@ -87,25 +137,19 @@ class MemoryService:
 
     def search_structured_memories(self, text: str):
         memories = self.structured_memory.get_all()
-        query_words = {
-            word.casefold().strip(".,!?;:")
-            for word in text.split()
-            if len(word.strip(".,!?;:")) > 2
-        }
+        query_words = _memory_terms(text)
 
         relevant = []
 
         for memory in memories:
-            key = memory["key"].casefold()
-            value = memory["value"].casefold()
+            memory_words = _memory_terms(
+                f"{memory['key']} {memory['value']}"
+            )
+            matching_words = query_words & memory_words
 
             if (
-                key in text.casefold()
-                or value in text.casefold()
-                or any(
-                    word in key or word in value
-                    for word in query_words
-                )
+                matching_words
+                and len(matching_words) >= min(2, len(query_words))
             ):
                 relevant.append(memory)
 

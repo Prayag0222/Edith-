@@ -13,7 +13,6 @@ class VoiceDecision:
 
 
 class AdaptiveVoiceEngine:
-    GPU_BUSY_THRESHOLD = 40.0
     MIN_FREE_VRAM_MB = 1800.0
 
     def __init__(self):
@@ -86,9 +85,15 @@ class AdaptiveVoiceEngine:
                 "small", "cpu", "int8", "GPU unavailable"
             )
 
-        if task_type == "command":
+        if gpu_model_loaded:
+            stats = self.get_gpu_stats()
+            gpu_usage = stats.get("gpu_usage")
+            reason = f"Reusing cached GPU model for {task_type}"
+            if gpu_usage is not None:
+                reason += f" (GPU {gpu_usage:.0f}%)"
             return VoiceDecision(
-                "small", "cpu", "int8", "Simple command"
+                "medium", "cuda", "float16",
+                reason,
             )
 
         stats = self.get_gpu_stats()
@@ -102,20 +107,6 @@ class AdaptiveVoiceEngine:
         gpu_usage = stats["gpu_usage"]
         vram_free = stats["vram_free"]
 
-        if gpu_usage >= self.GPU_BUSY_THRESHOLD:
-            return VoiceDecision(
-                "small", "cpu", "int8",
-                f"GPU compute busy ({gpu_usage:.0f}%)",
-            )
-
-        # A cached model may be reusable even when little VRAM remains.
-        # If it is already loaded, do not reject it based on free VRAM alone.
-        if gpu_model_loaded:
-            return VoiceDecision(
-                "medium", "cuda", "float16",
-                f"Reusing cached GPU model (GPU {gpu_usage:.0f}%)",
-            )
-
         if vram_free < self.MIN_FREE_VRAM_MB:
             return VoiceDecision(
                 "small", "cpu", "int8",
@@ -124,7 +115,8 @@ class AdaptiveVoiceEngine:
 
         return VoiceDecision(
             "medium", "cuda", "float16",
-            f"GPU available (GPU {gpu_usage:.0f}%, free VRAM {vram_free:.0f} MB)",
+            f"GPU prioritized for {task_type} "
+            f"(GPU {gpu_usage:.0f}%, free VRAM {vram_free:.0f} MB)",
         )
 
     def get_decision(

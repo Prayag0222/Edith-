@@ -4,6 +4,7 @@ from app.voice.cuda_runtime import setup_cuda_runtime
 from app.voice.adaptive_engine import AdaptiveVoiceEngine
 from app.voice.audio import AudioRecorder
 from app.voice.model_manager import WhisperModelManager
+from app.voice.noise_suppression import NoiseSuppressor
 from app.voice.task_classifier import VoiceTaskClassifier
 
 
@@ -27,6 +28,9 @@ class SpeechToText:
             vad_aggressiveness=vad_aggressiveness,
         )
 
+        self.noise_suppressor = NoiseSuppressor(
+            sample_rate=sample_rate,
+        )
         self.adaptive_engine = AdaptiveVoiceEngine()
         self.model_manager = WhisperModelManager()
         self.task_classifier = VoiceTaskClassifier()
@@ -100,6 +104,7 @@ class SpeechToText:
             print("No speech detected.")
             return None
 
+        audio = self.noise_suppressor.process(audio)
         temporary_path = self.audio_recorder.save_wav(audio)
 
         try:
