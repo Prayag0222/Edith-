@@ -8,6 +8,7 @@ import sounddevice as sd
 from piper import PiperVoice
 from app.voice.text_normalizer import normalize_for_speech
 
+
 class TextToSpeech:
     def __init__(
         self,
@@ -22,7 +23,6 @@ class TextToSpeech:
 
         print("[TTS] Loading Piper voice...")
 
-        # Load model only once.
         self.voice = PiperVoice.load(
             model_path=self.voice_path,
             use_cuda=False,
@@ -30,7 +30,6 @@ class TextToSpeech:
 
         self.sample_rate = self.voice.config.sample_rate
 
-        # Keep audio output open.
         self.output_stream = sd.OutputStream(
             samplerate=self.sample_rate,
             channels=1,
@@ -61,7 +60,8 @@ class TextToSpeech:
                             continue
 
                         for chunk in self.voice.synthesize(clean_text):
-                            audio_queue.put(chunk)
+                            audio_queue.put(chunk.audio_float_array)
+
                     finally:
                         speech_queue.task_done()
 
@@ -100,7 +100,6 @@ class TextToSpeech:
             return
 
         speech_queue = queue.Queue()
-
         speech_queue.put(text)
         speech_queue.put(None)
 

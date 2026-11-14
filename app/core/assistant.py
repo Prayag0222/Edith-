@@ -28,7 +28,6 @@ class EdithAssistant:
         memory_manager,
         user_input,
     ):
-        memory_manager.process_message(user_input)
 
         memory_context = conversation.memory_service.get_context(
             user_input
@@ -39,13 +38,19 @@ class EdithAssistant:
 
         response_parts = []
 
-        for chunk in llm.generate_stream(
-            messages,
-            memory_context=memory_context,
-        ):
-            if chunk:
-                response_parts.append(chunk)
-                yield chunk
+        try:
+            for chunk in llm.generate_stream(
+                messages,
+                memory_context=memory_context,
+            ):
+                if chunk:
+                    response_parts.append(chunk)
+                    yield chunk
+        finally:
+            conversation.process_user_memory(
+                user_input,
+                memory_manager,
+            )
 
         response = "".join(response_parts).strip()
 

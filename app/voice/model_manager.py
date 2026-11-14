@@ -36,6 +36,7 @@ class WhisperModelManager:
             "small",
             device="cpu",
             compute_type="int8",
+            local_files_only=True,
         )
 
         print("[STT] CPU small model ready.")
@@ -60,6 +61,7 @@ class WhisperModelManager:
             "medium",
             device="cuda",
             compute_type="float16",
+            local_files_only=True,
         )
 
         print("[STT] CUDA medium model ready.")

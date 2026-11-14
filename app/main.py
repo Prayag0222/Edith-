@@ -7,6 +7,7 @@ from app.conversation.service import ConversationService
 from app.core.assistant import EdithAssistant
 from app.memory.service import MemoryService
 from app.memory.manager import MemoryManager
+from app.memory.background_worker import BackgroundMemoryWorker
 from app.voice.stt import SpeechToText
 from app.voice.tts import TextToSpeech
 from app.voice.wake_word import WakeWordDetector
@@ -63,25 +64,15 @@ def speech_worker(tts, speech_queue):
         print(f"\n[TTS ERROR] {error}")
 
 
-def main():
-    edith = EdithAssistant()
-    llm = OllamaClient(edith)
-
-    memory = MemoryService()
-    memory_manager = MemoryManager(llm)
-
-    conversation = ConversationService(memory)
-    stt = SpeechToText()
-    tts = TextToSpeech()
-    wake_word = WakeWordDetector()
-
-    if llm.is_available():
-        print("EDITH is ready — Local AI: Online\n")
-    else:
-        print("EDITH is ready — Local AI: Offline\n")
-
-    print("Type 'exit' to stop.\n")
-
+def run_assistant(
+    edith,
+    llm,
+    conversation,
+    stt,
+    tts,
+    wake_word,
+    memory_manager,
+):
     while True:
         print("[READY] Waiting for wake word...")
 
@@ -162,6 +153,41 @@ def main():
                 speech_queue.put(None)
                 speech_queue.join()
                 worker.join()
+
+
+def main():
+    edith = EdithAssistant()
+    llm = OllamaClient(edith)
+
+    stt = SpeechToText()
+    tts = TextToSpeech()
+    wake_word = WakeWordDetector()
+
+    memory = MemoryService()
+    memory_manager = MemoryManager(llm)
+    memory_worker = BackgroundMemoryWorker(memory, memory_manager, llm)
+
+    conversation = ConversationService(memory, memory_worker)
+
+    if llm.is_available():
+        print("EDITH is ready — Local AI: Online\n")
+    else:
+        print("EDITH is ready — Local AI: Offline\n")
+
+    print("Type 'exit' to stop.\n")
+
+    try:
+        run_assistant(
+            edith,
+            llm,
+            conversation,
+            stt,
+            tts,
+            wake_word,
+            memory_manager,
+        )
+    finally:
+        memory_worker.close()
 
 
 if __name__ == "__main__":

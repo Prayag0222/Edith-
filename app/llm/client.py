@@ -1,4 +1,5 @@
 import json
+import threading
 import urllib.error
 import urllib.request
 
@@ -12,6 +13,7 @@ class OllamaClient:
         self.edith = edith
         self.model = model or settings.OLLAMA_MODEL
         self.base_url = settings.OLLAMA_BASE_URL
+        self.request_lock = threading.RLock()
 
     def is_available(self) -> bool:
         url = f"{self.base_url}/api/tags"
@@ -83,6 +85,11 @@ COMMUNICATION RULES
 * Respond naturally, clearly, and directly.
 """
 
+
+        print("\n[DEBUG] MEMORY CONTEXT SENT TO OLLAMA:")
+        print(memory_context)
+        print("[DEBUG] END MEMORY CONTEXT\n")
+
         return [
             {
                 "role": "system",
@@ -92,6 +99,17 @@ COMMUNICATION RULES
         ]
 
     def generate_stream(
+        self,
+        messages: list[dict],
+        memory_context: str = "",
+    ):
+        with self.request_lock:
+            yield from self._generate_stream(
+                messages,
+                memory_context,
+            )
+
+    def _generate_stream(
         self,
         messages: list[dict],
         memory_context: str = "",
