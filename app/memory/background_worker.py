@@ -156,9 +156,11 @@ class BackgroundMemoryWorker:
         }
 
     def wait_until_idle(self):
-
-        self.persistence_queue.join()
+        self.wait_for_persistence()
         self.extraction_queue.join()
+
+    def wait_for_persistence(self):
+        self.persistence_queue.join()
 
     # ---------------- SHUTDOWN ----------------
 

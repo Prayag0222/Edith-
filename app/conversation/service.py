@@ -64,6 +64,10 @@ class ConversationService:
         else:
             self.background_worker.submit_extraction(content)
 
+    def wait_for_persistence(self):
+        if self.background_worker is not None:
+            self.background_worker.wait_for_persistence()
+
     def _trim_messages(self):
         if len(self.messages) > self.max_messages:
             self.messages = self.messages[-self.max_messages:]

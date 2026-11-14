@@ -28,7 +28,7 @@ class EdithAssistant:
         memory_manager,
         user_input,
     ):
-
+        conversation.wait_for_persistence()
         memory_context = conversation.memory_service.get_context(
             user_input
         )

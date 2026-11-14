@@ -56,6 +56,8 @@ def main():
         "vram_used": 113.0,
         "vram_total": 4096.0,
         "vram_usage": 2.8,
+        "vram_free": 3983.0,
+        "available": True,
     }
 
     print_decision(
@@ -73,6 +75,8 @@ def main():
         "vram_used": 1500.0,
         "vram_total": 4096.0,
         "vram_usage": 36.6,
+        "vram_free": 2596.0,
+        "available": True,
     }
 
     print_decision(
@@ -90,6 +94,8 @@ def main():
         "vram_used": 3600.0,
         "vram_total": 4096.0,
         "vram_usage": 87.9,
+        "vram_free": 496.0,
+        "available": True,
     }
 
     print_decision(
@@ -111,7 +117,7 @@ def main():
     )
 
     # --------------------------------------------------
-    # Scenario 5: Command always uses CPU
+    # Scenario 5: GPU is preferred even for commands
     # --------------------------------------------------
 
     engine.gpu_available = True
@@ -121,6 +127,8 @@ def main():
         "vram_used": 113.0,
         "vram_total": 4096.0,
         "vram_usage": 2.8,
+        "vram_free": 3983.0,
+        "available": True,
     }
 
     print_decision(
