@@ -1,10 +1,18 @@
 from app.memory.structured_store import (
-    save_structured_memory,
+    upsert_structured_memory,
     load_structured_memories,
     update_structured_memory,
     delete_structured_memory,
-    find_structured_memory
+    find_structured_memory,
 )
+
+
+VALID_MEMORY_TYPES = {
+    "fact",
+    "preference",
+    "project",
+    "person",
+}
 
 
 class StructuredMemoryService:
@@ -15,20 +23,30 @@ class StructuredMemoryService:
         key: str,
         value: str,
     ):
-        existing_memory = self.find(
-            memory_type,
-            key,
-        )
 
-        if existing_memory is not None:
-            update_structured_memory(
-                existing_memory["id"],
-                value,
+        if not all(
+            isinstance(item, str)
+            for item in (memory_type, key, value)
+        ):
+            raise ValueError(
+                "Memory fields must be strings."
             )
 
-            return existing_memory["id"]
+        memory_type = memory_type.strip().lower()
+        key = key.strip()
+        value = value.strip()
 
-        return save_structured_memory(
+        if memory_type not in VALID_MEMORY_TYPES:
+            raise ValueError(
+                f"Unsupported memory type: {memory_type}"
+            )
+
+        if not key or not value:
+            raise ValueError(
+                "Memory key and value are required."
+            )
+
+        return upsert_structured_memory(
             memory_type,
             key,
             value,
@@ -42,7 +60,7 @@ class StructuredMemoryService:
         memory_id: int,
         value: str,
     ):
-        update_structured_memory(
+        return update_structured_memory(
             memory_id,
             value,
         )
@@ -51,7 +69,7 @@ class StructuredMemoryService:
         self,
         memory_id: int,
     ):
-        delete_structured_memory(
+        return delete_structured_memory(
             memory_id,
         )
 
@@ -63,7 +81,7 @@ class StructuredMemoryService:
         return find_structured_memory(
             memory_type,
             key,
-        )    
+        )
 
     def get(
         self,
@@ -74,5 +92,3 @@ class StructuredMemoryService:
             memory_type,
             key,
         )
-
-     
