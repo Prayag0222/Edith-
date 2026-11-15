@@ -7,7 +7,7 @@ from app.conversation.service import ConversationService
 from app.core.assistant import EdithAssistant
 from app.memory.service import MemoryService
 from app.memory.manager import MemoryManager
-from app.memory.background_worker import BackgroundMemoryWorker
+from app.memory.workers.worker_manager import BackgroundMemoryWorker
 from app.voice.stt import SpeechToText
 from app.voice.tts import TextToSpeech
 from app.voice.wake_word import WakeWordDetector
