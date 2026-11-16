@@ -1,4 +1,7 @@
 import os
+from typing import Optional, Union
+
+import numpy as np
 
 from app.voice.cuda_runtime import setup_cuda_runtime
 from app.voice.adaptive_engine import AdaptiveVoiceEngine
@@ -8,10 +11,24 @@ from app.voice.noise_suppression import NoiseSuppressor
 from app.voice.task_classifier import VoiceTaskClassifier
 
 
+# Initialize CUDA runtime once when this module loads.
 setup_cuda_runtime()
 
 
 class SpeechToText:
+    """
+    EDITH Speech-to-Text engine.
+
+    Features:
+        - Adaptive CPU/GPU model selection
+        - Lazy Whisper model loading
+        - Cached model reuse
+        - Direct NumPy audio transcription
+        - Noise suppression
+        - Voice activity detection
+        - Task classification
+    """
+
     def __init__(
         self,
         sample_rate: int = 16000,
@@ -20,6 +37,8 @@ class SpeechToText:
         max_recording_seconds: float = 20.0,
         vad_aggressiveness: int = 2,
     ):
+        self.sample_rate = sample_rate
+
         self.audio_recorder = AudioRecorder(
             sample_rate=sample_rate,
             channels=channels,
@@ -31,14 +50,19 @@ class SpeechToText:
         self.noise_suppressor = NoiseSuppressor(
             sample_rate=sample_rate,
         )
+
         self.adaptive_engine = AdaptiveVoiceEngine()
         self.model_manager = WhisperModelManager()
         self.task_classifier = VoiceTaskClassifier()
 
+    # --------------------------------------------------
+    # MODEL SELECTION
+    # --------------------------------------------------
+
     def _get_model(self):
         decision = self.adaptive_engine.get_decision(
-        "conversation",
-        gpu_model_loaded=self.model_manager.is_gpu_model_loaded(),
+            task_type="conversation",
+            gpu_model_loaded=self.model_manager.is_gpu_model_loaded(),
         )
 
         if (
@@ -51,16 +75,19 @@ class SpeechToText:
 
         return model, decision
 
-    def transcribe_file(self, audio_path: str):
+    # --------------------------------------------------
+    # TRANSCRIPTION
+    # --------------------------------------------------
+
+    def _transcribe(
+        self,
+        audio: Union[str, np.ndarray],
+    ) -> Optional[dict]:
+
         model, decision = self._get_model()
 
-        print(
-            f"[STT] {decision.model_size} "
-            f"{decision.device}"
-        )
-
         segments, info = model.transcribe(
-            audio_path,
+            audio,
             beam_size=5,
             language=None,
             vad_filter=True,
@@ -70,6 +97,8 @@ class SpeechToText:
             condition_on_previous_text=False,
         )
 
+        # faster-whisper generates segments lazily.
+        # Consume them once.
         text_parts = []
 
         for segment in segments:
@@ -97,25 +126,61 @@ class SpeechToText:
             "classification_confidence": classification.confidence,
         }
 
-    def listen(self):
+    # --------------------------------------------------
+    # FILE TRANSCRIPTION
+    # --------------------------------------------------
+
+    def transcribe_file(self, audio_path: str) -> Optional[dict]:
+        """
+        Transcribe an existing audio file.
+
+        Preserves the existing public interface.
+        """
+
+        if not os.path.isfile(audio_path):
+            raise FileNotFoundError(
+                f"Audio file not found: {audio_path}"
+            )
+
+        return self._transcribe(audio_path)
+
+    # --------------------------------------------------
+    # LIVE LISTENING
+    # --------------------------------------------------
+
+    def listen(self) -> Optional[dict]:
+        """
+        Record, suppress noise and transcribe speech.
+
+        Uses NumPy audio directly instead of creating
+        and reopening a temporary WAV file.
+        """
+
         audio = self.audio_recorder.record_until_silence()
 
         if audio is None:
-            print("No speech detected.")
+            return None
+
+        audio = np.asarray(
+            audio,
+            dtype=np.float32,
+        ).reshape(-1)
+
+        if audio.size == 0:
             return None
 
         audio = self.noise_suppressor.process(audio)
-        temporary_path = self.audio_recorder.save_wav(audio)
 
-        try:
-            result = self.transcribe_file(temporary_path)
+        if audio.size == 0:
+            return None
 
-            if result is None:
-                print("No speech recognized.")
-                return None
+        return self._transcribe(audio)
 
-            return result
+    # --------------------------------------------------
+    # SHUTDOWN
+    # --------------------------------------------------
 
-        finally:
-            if os.path.exists(temporary_path):
-                os.remove(temporary_path)
+    def close(self):
+        """Release background resources."""
+
+        self.adaptive_engine.close()

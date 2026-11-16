@@ -1,6 +1,8 @@
 import tempfile
 import wave
 from collections import deque
+from math import ceil
+from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
@@ -10,17 +12,26 @@ from app.voice.vad import VoiceActivityDetector
 
 class AudioRecorder:
     """
-    Handles microphone input and audio preparation.
+    Microphone capture and speech-aware audio recording.
 
-    Responsibilities:
-        - Capture microphone audio
-        - Detect human speech using WebRTC VAD
-        - Reject silence/background noise
-        - Keep a short pre-buffer
-        - Continue recording through brief VAD mistakes
-        - Detect genuine end-of-speech
-        - Convert recorded audio into a WAV file
+    Features:
+        - 16 kHz mono microphone capture
+        - WebRTC voice activity detection
+        - Short pre-buffer to preserve initial words
+        - Tolerance for brief speech detection failures
+        - Configurable silence termination
+        - Maximum recording duration
+        - Temporary WAV generation
     """
+
+    BLOCK_DURATION = 0.12
+    VAD_FRAME_DURATION_MS = 30
+
+    PRE_BUFFER_SECONDS = 0.5
+    SPEECH_START_RMS = 0.008
+    SPEECH_CONTINUATION_RMS = 0.012
+
+    SUPPORTED_SAMPLE_RATES = (8000, 16000, 32000, 48000)
 
     def __init__(
         self,
@@ -30,16 +41,55 @@ class AudioRecorder:
         max_recording_seconds: float = 20.0,
         vad_aggressiveness: int = 2,
         initial_silence_timeout: float = 8.0,
-
     ):
+        if sample_rate not in self.SUPPORTED_SAMPLE_RATES:
+            raise ValueError(
+                f"Unsupported VAD sample rate: {sample_rate}"
+            )
+
+        if channels != 1:
+            raise ValueError(
+                "AudioRecorder requires mono microphone input."
+            )
+
+        if silence_duration <= 0:
+            raise ValueError("silence_duration must be positive.")
+
+        if max_recording_seconds <= 0:
+            raise ValueError(
+                "max_recording_seconds must be positive."
+            )
+
+        if initial_silence_timeout <= 0:
+            raise ValueError(
+                "initial_silence_timeout must be positive."
+            )
+
         self.sample_rate = sample_rate
         self.channels = channels
 
         self.silence_duration = silence_duration
-        self.max_recording_seconds = (
-            max_recording_seconds
-        )
+        self.max_recording_seconds = max_recording_seconds
         self.initial_silence_timeout = initial_silence_timeout
+
+        self.block_size = int(
+            self.sample_rate * self.BLOCK_DURATION
+        )
+
+        self.block_duration = (
+            self.block_size / self.sample_rate
+        )
+
+        self.frame_size = int(
+            self.sample_rate
+            * self.VAD_FRAME_DURATION_MS
+            / 1000
+        )
+
+        if self.block_size % self.frame_size != 0:
+            raise ValueError(
+                "Audio block size must contain complete VAD frames."
+            )
 
         self.vad = VoiceActivityDetector(
             sample_rate=self.sample_rate,
@@ -50,36 +100,13 @@ class AudioRecorder:
     # AUDIO CONVERSION
     # --------------------------------------------------
 
-    def _float_to_pcm16(
-        self,
-        audio: np.ndarray,
-    ) -> bytes:
-        """
-        Convert float32 microphone audio into
-        signed 16-bit PCM bytes.
-
-        WebRTC VAD requires:
-            - mono
-            - PCM16
-            - 10/20/30 ms frames
-        """
-
-        audio = np.asarray(
-            audio,
-            dtype=np.float32,
-        )
-
-        audio = np.clip(
-            audio,
-            -1.0,
-            1.0,
-        )
+    @staticmethod
+    def _float_to_pcm16(audio: np.ndarray) -> bytes:
+        audio = np.asarray(audio, dtype=np.float32)
 
         pcm_audio = (
-            audio * 32767
-        ).astype(
-            np.int16
-        )
+            np.clip(audio, -1.0, 1.0) * 32767
+        ).astype(np.int16)
 
         return pcm_audio.tobytes()
 
@@ -87,66 +114,38 @@ class AudioRecorder:
     # AUDIO ENERGY
     # --------------------------------------------------
 
-    def _calculate_rms(
-        self,
-        audio: np.ndarray,
-    ) -> float:
-        """
-        Calculate RMS audio energy.
-
-        RMS gives us a simple measurement of
-        how loud the microphone signal is.
-        """
-
-        if len(audio) == 0:
+    @staticmethod
+    def _calculate_rms(audio: np.ndarray) -> float:
+        if audio.size == 0:
             return 0.0
 
-        audio = audio.astype(
-            np.float32
-        )
+        audio = np.asarray(audio, dtype=np.float32)
 
         return float(
-            np.sqrt(
-                np.mean(
-                    np.square(audio)
-                )
-            )
+            np.sqrt(np.mean(audio * audio))
         )
 
     # --------------------------------------------------
     # FRAME SPLITTING
     # --------------------------------------------------
 
-    def _frame_audio(
-        self,
-        audio: np.ndarray,
-        frame_duration_ms: int = 30,
-    ):
+    def _frame_audio(self, audio: np.ndarray):
         """
-        Split audio into WebRTC-compatible frames.
+        Split audio into complete 30 ms WebRTC frames.
 
-        WebRTC VAD supports:
-            10 ms
-            20 ms
-            30 ms
-
-        EDITH uses 30 ms frames.
+        Recording blocks are configured to contain an exact
+        number of VAD frames, preventing discarded samples.
         """
-
-        frame_size = int(
-            self.sample_rate
-            * frame_duration_ms
-            / 1000
-        )
-
-        total_samples = len(audio)
 
         for start in range(
             0,
-            total_samples - frame_size + 1,
-            frame_size,
+            len(audio),
+            self.frame_size,
         ):
-            end = start + frame_size
+            end = start + self.frame_size
+
+            if end > len(audio):
+                break
 
             yield audio[start:end]
 
@@ -154,55 +153,16 @@ class AudioRecorder:
     # VAD ANALYSIS
     # --------------------------------------------------
 
-    def _analyze_speech(
-        self,
-        audio_chunk: np.ndarray,
-    ):
-        """
-        Analyze one microphone block.
-
-        Returns:
-
-            {
-                "rms": float,
-                "speech_frames": int,
-                "total_frames": int,
-            }
-
-        This method does NOT decide whether EDITH
-        should start or stop recording.
-
-        It only gathers evidence.
-        """
-
-        rms = self._calculate_rms(
-            audio_chunk
-        )
+    def _analyze_speech(self, audio_chunk: np.ndarray) -> dict:
+        rms = self._calculate_rms(audio_chunk)
 
         speech_frames = 0
         total_frames = 0
 
-        for frame in self._frame_audio(
-            audio_chunk,
-            frame_duration_ms=30,
-        ):
-            pcm_frame = (
-                self._float_to_pcm16(
-                    frame
-                )
-            )
+        for frame in self._frame_audio(audio_chunk):
+            pcm_frame = self._float_to_pcm16(frame)
 
-            try:
-
-                is_speech = (
-                    self.vad.is_speech(
-                        pcm_frame
-                    )
-                )
-
-            except Exception:
-
-                is_speech = False
+            is_speech = self.vad.is_speech(pcm_frame)
 
             total_frames += 1
 
@@ -219,137 +179,61 @@ class AudioRecorder:
     # SPEECH START DETECTION
     # --------------------------------------------------
 
-    def _is_speech_start(
-        self,
-        analysis,
-    ) -> bool:
-        """
-        Decide whether the user has actually started
-        speaking.
-
-        Starting recording is intentionally stricter
-        than continuing an existing recording.
-
-        This prevents random background noise from
-        waking EDITH.
-        """
-
-        rms = analysis["rms"]
-        speech_frames = analysis[
-            "speech_frames"
-        ]
-
-        # Very quiet microphone signal.
-        if rms < 0.008:
+    def _is_speech_start(self, analysis: dict) -> bool:
+        if analysis["rms"] < self.SPEECH_START_RMS:
             return False
 
-        # Require multiple VAD-positive frames
-        # before declaring that speech has started.
-        if speech_frames >= 2:
-            return True
-
-        return False
+        return analysis["speech_frames"] >= 2
 
     # --------------------------------------------------
     # SPEECH CONTINUATION
     # --------------------------------------------------
 
-    def _is_speech_continuation(
-        self,
-        analysis,
-    ) -> bool:
-        """
-        Decide whether an already-active speech session
-        should continue.
-
-        This is intentionally more forgiving.
-
-        Natural speech contains:
-            - quiet syllables
-            - pauses
-            - consonants
-            - short VAD mistakes
-
-        We don't want those to terminate recording.
-        """
-
-        rms = analysis["rms"]
-        speech_frames = analysis[
-            "speech_frames"
-        ]
-
-        # Strong VAD evidence.
-        if speech_frames >= 1:
+    def _is_speech_continuation(self, analysis: dict) -> bool:
+        if analysis["speech_frames"] >= 1:
             return True
 
-        # Moderate audio energy.
-
-        # This allows EDITH to survive short VAD
-        # mistakes while the user is still talking.
-        if rms >= 0.012:
-            return True
-
-        return False
+        return (
+            analysis["rms"]
+            >= self.SPEECH_CONTINUATION_RMS
+        )
 
     # --------------------------------------------------
     # RECORDING
     # --------------------------------------------------
 
     def record_until_silence(self):
-        """
-        Record microphone input until genuine silence.
-
-        Recording has two states:
-
-            WAITING
-                ↓
-            SPEECH START
-                ↓
-            RECORDING
-                ↓
-            TEMPORARY VAD MISS
-                ↓
-            CONTINUE
-                ↓
-            REAL SILENCE
-                ↓
-            STOP
-
-        This prevents both:
-
-            1. Background noise from triggering EDITH.
-            2. Natural speech from being cut prematurely.
-        """
-
-        block_duration = 0.1
-
-        block_size = int(
-            self.sample_rate
-            * block_duration
-        )
-
         silence_blocks_required = max(
             1,
-            int(
+            ceil(
                 self.silence_duration
-                / block_duration
+                / self.block_duration
             ),
         )
 
-        max_blocks = int(
-            self.max_recording_seconds
-            / block_duration
+        max_blocks = max(
+            1,
+            ceil(
+                self.max_recording_seconds
+                / self.block_duration
+            ),
         )
 
-        initial_silence_blocks = int(
-            self.initial_silence_timeout
-            / block_duration
+        initial_silence_blocks = max(
+            1,
+            ceil(
+                self.initial_silence_timeout
+                / self.block_duration
+            ),
         )
 
-        # 500 ms pre-buffer.
-        #
-        # This protects the beginning of words.
-        pre_buffer_blocks = 5
+        pre_buffer_blocks = max(
+            1,
+            round(
+                self.PRE_BUFFER_SECONDS
+                / self.block_duration
+            ),
+        )
 
         pre_buffer = deque(
             maxlen=pre_buffer_blocks
@@ -360,46 +244,31 @@ class AudioRecorder:
         speaking = False
         silent_blocks = 0
 
-        print("Listening...")
-
         with sd.InputStream(
             samplerate=self.sample_rate,
             channels=self.channels,
             dtype="float32",
-            blocksize=block_size,
+            blocksize=self.block_size,
         ) as stream:
 
             for block_index in range(max_blocks):
 
-                audio_chunk, overflowed = (
-                    stream.read(
-                        block_size
-                    )
+                audio_chunk, overflowed = stream.read(
+                    self.block_size
                 )
 
                 if overflowed:
                     print(
-                        "Warning: microphone "
-                        "buffer overflow."
+                        "[AUDIO] Microphone buffer overflow."
                     )
 
-                audio_chunk = (
-                    audio_chunk.copy()
-                )
+                mono_chunk = audio_chunk[:, 0].copy()
 
-                mono_chunk = (
-                    audio_chunk[:, 0]
-                )
-
-                analysis = (
-                    self._analyze_speech(
-                        mono_chunk
-                    )
-                )
-
-                pre_buffer.append(
+                analysis = self._analyze_speech(
                     mono_chunk
                 )
+
+                pre_buffer.append(mono_chunk)
 
                 # ----------------------------------
                 # WAITING FOR SPEECH
@@ -407,53 +276,36 @@ class AudioRecorder:
 
                 if not speaking:
 
-                    speech_started = (
-                        self._is_speech_start(
-                            analysis
-                        )
-                    )
-
-                    if speech_started:
+                    if self._is_speech_start(analysis):
 
                         speaking = True
 
                         recorded_chunks.extend(
-                            list(pre_buffer)
+                            pre_buffer
                         )
 
                         silent_blocks = 0
 
-                    elif block_index + 1 >= initial_silence_blocks:
-                        print("[STT] Initial silence timeout.")
+                    elif (
+                        block_index + 1
+                        >= initial_silence_blocks
+                    ):
                         return None
-
 
                     continue
 
                 # ----------------------------------
-                # ALREADY RECORDING
+                # RECORDING SPEECH
                 # ----------------------------------
 
-                speech_continues = (
-                    self._is_speech_continuation(
-                        analysis
-                    )
-                )
+                recorded_chunks.append(mono_chunk)
 
-                recorded_chunks.append(
-                    mono_chunk
-                )
+                if self._is_speech_continuation(analysis):
 
-                if speech_continues:
-
-                    # User is still talking.
-                    #
-                    # Reset the silence timer.
                     silent_blocks = 0
 
                 else:
 
-                    # Possible silence.
                     silent_blocks += 1
 
                     if (
@@ -462,14 +314,7 @@ class AudioRecorder:
                     ):
                         break
 
-        # ------------------------------------------
-        # NO SPEECH EVER STARTED
-        # ------------------------------------------
-
-        if not speaking:
-            return None
-
-        if not recorded_chunks:
+        if not speaking or not recorded_chunks:
             return None
 
         return np.concatenate(
@@ -480,63 +325,53 @@ class AudioRecorder:
     # WAV CREATION
     # --------------------------------------------------
 
-    def save_wav(
-        self,
-        audio,
-    ):
+    def save_wav(self, audio: np.ndarray) -> str:
         """
-        Save recorded audio as a temporary WAV file.
+        Save mono float32 audio as a temporary PCM16 WAV.
         """
-
-        temporary_file = (
-            tempfile.NamedTemporaryFile(
-                suffix=".wav",
-                delete=False,
-            )
-        )
-
-        temporary_path = (
-            temporary_file.name
-        )
-
-        temporary_file.close()
 
         audio = np.asarray(
             audio,
             dtype=np.float32,
-        )
+        ).reshape(-1)
 
-        audio = np.clip(
-            audio,
-            -1.0,
-            1.0,
-        )
+        if audio.size == 0:
+            raise ValueError("Cannot save empty audio.")
 
         pcm_audio = (
-            audio * 32767
-        ).astype(
-            np.int16
-        )
+            np.clip(audio, -1.0, 1.0) * 32767
+        ).astype(np.int16)
 
-        with wave.open(
-            temporary_path,
-            "wb",
-        ) as wav_file:
+        temporary_path = None
 
-            wav_file.setnchannels(
-                self.channels
-            )
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".wav",
+                delete=False,
+            ) as temporary_file:
 
-            wav_file.setsampwidth(
-                2
-            )
+                temporary_path = temporary_file.name
 
-            wav_file.setframerate(
-                self.sample_rate
-            )
+            with wave.open(
+                temporary_path,
+                "wb",
+            ) as wav_file:
 
-            wav_file.writeframes(
-                pcm_audio.tobytes()
-            )
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(self.sample_rate)
 
-        return temporary_path
+                wav_file.writeframes(
+                    pcm_audio.tobytes()
+                )
+
+            return temporary_path
+
+        except Exception:
+
+            if temporary_path:
+                Path(temporary_path).unlink(
+                    missing_ok=True
+                )
+
+            raise

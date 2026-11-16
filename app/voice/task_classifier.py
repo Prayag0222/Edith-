@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import re
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class TaskClassification:
     task_type: str
     confidence: float
@@ -11,123 +11,84 @@ class TaskClassification:
 
 class VoiceTaskClassifier:
     """
-    Classifies transcribed speech into:
+    Lightweight rule-based voice task classifier.
 
+    Categories:
         command
         conversation
+        unknown
 
-    This is intentionally lightweight.
-
-    It does NOT use an LLM or GPU.
+    No LLM, GPU or external dependencies.
     """
 
-    COMMAND_PATTERNS = [
-        r"^open\b",
-        r"^close\b",
-        r"^launch\b",
-        r"^start\b",
-        r"^stop\b",
-        r"^play\b",
-        r"^pause\b",
-        r"^resume\b",
-        r"^turn on\b",
-        r"^turn off\b",
-        r"^enable\b",
-        r"^disable\b",
-        r"^increase\b",
-        r"^decrease\b",
-        r"^raise\b",
-        r"^lower\b",
-        r"^mute\b",
-        r"^unmute\b",
-        r"^set\b",
-        r"^restart\b",
-        r"^shutdown\b",
-        r"^lock\b",
-        r"^search\b",
-        r"^go to\b",
-        r"^show\b",
-        r"^check\b",
-    ]
+    # --------------------------------------------------
+    # PRECOMPILED PATTERNS
+    # --------------------------------------------------
 
-    CONVERSATION_PATTERNS = [
-        r"\bwhy\b",
-        r"\bhow\b",
-        r"\bwhat\b",
-        r"\bwhen\b",
-        r"\bwhere\b",
-        r"\bwho\b",
-        r"\bexplain\b",
-        r"\btell me\b",
-        r"\bcan you explain\b",
-        r"\bdo you think\b",
-        r"\bwhat do you think\b",
-    ]
+    COMMAND_PATTERN = re.compile(
+        r"^(?:"
+        r"open|close|launch|start|stop|play|pause|resume|"
+        r"turn on|turn off|enable|disable|increase|decrease|"
+        r"raise|lower|mute|unmute|set|restart|shutdown|"
+        r"lock|search|go to|show|check"
+        r")\b"
+    )
 
-    def classify(
-        self,
-        text: str,
-    ) -> TaskClassification:
+    CONVERSATION_PATTERN = re.compile(
+        r"\b(?:"
+        r"why|how|what|when|where|who|explain|"
+        r"tell me|can you explain|do you think|"
+        r"what do you think"
+        r")\b"
+    )
 
-        if not text:
+    # --------------------------------------------------
+    # CLASSIFICATION
+    # --------------------------------------------------
+
+    def classify(self, text: str) -> TaskClassification:
+
+        if not isinstance(text, str) or not text.strip():
             return TaskClassification(
                 task_type="unknown",
                 confidence=0.0,
                 reason="Empty transcription",
             )
 
-        text = text.strip().lower()
+        # Normalize text once.
+        text = " ".join(text.lower().split())
 
-        # Remove excessive whitespace.
-        text = re.sub(
-            r"\s+",
-            " ",
-            text,
-        )
-
-        # -----------------------------------------
+        # ----------------------------------------------
         # COMMAND DETECTION
-        # -----------------------------------------
+        # ----------------------------------------------
 
-        for pattern in self.COMMAND_PATTERNS:
+        if self.COMMAND_PATTERN.search(text):
 
-            if re.search(
-                pattern,
-                text,
-            ):
-                return TaskClassification(
-                    task_type="command",
-                    confidence=0.90,
-                    reason=(
-                        "Command pattern detected"
-                    ),
-                )
+            return TaskClassification(
+                task_type="command",
+                confidence=0.90,
+                reason="Command pattern detected",
+            )
 
-        # -----------------------------------------
+        # ----------------------------------------------
         # CONVERSATION DETECTION
-        # -----------------------------------------
+        # ----------------------------------------------
 
-        for pattern in self.CONVERSATION_PATTERNS:
+        if self.CONVERSATION_PATTERN.search(text):
 
-            if re.search(
-                pattern,
-                text,
-            ):
-                return TaskClassification(
-                    task_type="conversation",
-                    confidence=0.90,
-                    reason=(
-                        "Conversation pattern detected"
-                    ),
-                )
+            return TaskClassification(
+                task_type="conversation",
+                confidence=0.90,
+                reason="Conversation pattern detected",
+            )
 
-        # -----------------------------------------
+        # ----------------------------------------------
         # SHORT UTTERANCE HEURISTIC
-        # -----------------------------------------
+        # ----------------------------------------------
 
-        words = text.split()
+        word_count = len(text.split())
 
-        if len(words) <= 5:
+        if word_count <= 5:
 
             return TaskClassification(
                 task_type="command",
@@ -138,9 +99,9 @@ class VoiceTaskClassifier:
                 ),
             )
 
-        # -----------------------------------------
+        # ----------------------------------------------
         # DEFAULT
-        # -----------------------------------------
+        # ----------------------------------------------
 
         return TaskClassification(
             task_type="conversation",
