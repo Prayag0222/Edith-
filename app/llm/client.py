@@ -84,12 +84,6 @@ COMMUNICATION RULES
 * Do not claim an action was completed unless it was actually executed.
 * Respond naturally, clearly, and directly.
 """
-
-
-        print("\n[DEBUG] MEMORY CONTEXT SENT TO OLLAMA:")
-        print(memory_context)
-        print("[DEBUG] END MEMORY CONTEXT\n")
-
         return [
             {
                 "role": "system",

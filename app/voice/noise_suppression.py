@@ -1,17 +1,16 @@
 import numpy as np
-import noisereduce as nr
 
 
 class NoiseSuppressor:
     """
     Non-stationary spectral noise suppression.
 
-    Responsibilities:
-        - Reduce environmental background noise.
-        - Preserve speech as much as possible.
-        - Avoid unnecessary processing of short recordings.
-        - Prevent excessive attenuation.
-        - Keep the original audio if processing fails.
+    Features:
+        - Lazy loading of noisereduce
+        - Configurable suppression strength
+        - Short-audio bypass
+        - Protection against excessive attenuation
+        - Safe fallback to original audio
     """
 
     def __init__(
@@ -21,62 +20,78 @@ class NoiseSuppressor:
         enabled: bool = True,
         minimum_duration: float = 0.25,
     ):
+        if sample_rate <= 0:
+            raise ValueError("Sample rate must be positive.")
+
+        if not np.isfinite(strength):
+            raise ValueError("Suppression strength must be finite.")
+
+        if minimum_duration < 0:
+            raise ValueError("Minimum duration cannot be negative.")
+
         self.sample_rate = sample_rate
         self.strength = float(np.clip(strength, 0.0, 1.0))
         self.enabled = enabled
         self.minimum_duration = minimum_duration
 
-    # -----------------------------------------------
-    # AUDIO METRICS
-    # -----------------------------------------------
+        self._noise_reduction = None
 
-    def _calculate_rms(self, audio: np.ndarray) -> float:
-        if len(audio) == 0:
+    # --------------------------------------------------
+    # AUDIO METRICS
+    # --------------------------------------------------
+
+    @staticmethod
+    def _calculate_rms(audio: np.ndarray) -> float:
+        if audio.size == 0:
             return 0.0
 
         return float(
-            np.sqrt(
-                np.mean(
-                    np.square(audio.astype(np.float32))
-                )
-            )
+            np.sqrt(np.mean(np.square(audio)))
         )
 
-    # -----------------------------------------------
+    # --------------------------------------------------
+    # LAZY DEPENDENCY LOADING
+    # --------------------------------------------------
+
+    def _load_noise_reduction(self):
+        if self._noise_reduction is None:
+            import noisereduce
+
+            self._noise_reduction = noisereduce.reduce_noise
+
+        return self._noise_reduction
+
+    # --------------------------------------------------
     # NOISE SUPPRESSION
-    # -----------------------------------------------
+    # --------------------------------------------------
 
     def process(self, audio: np.ndarray) -> np.ndarray:
-
         audio = np.asarray(
             audio,
             dtype=np.float32,
-        ).flatten()
+        ).reshape(-1)
 
-        if not self.enabled:
+        if not self.enabled or self.strength <= 0:
             return audio
 
-        if len(audio) == 0:
+        if audio.size == 0:
             return audio
 
-        duration = len(audio) / self.sample_rate
+        duration = audio.size / self.sample_rate
 
         if duration < self.minimum_duration:
             return audio
 
-        original_audio = audio.copy()
+        original_rms = self._calculate_rms(audio)
 
-        original_rms = self._calculate_rms(
-            original_audio
-        )
-
-        if original_rms < 0.001:
-            return original_audio
+        if not np.isfinite(original_rms) or original_rms < 0.001:
+            return audio
 
         try:
+            reduce_noise = self._load_noise_reduction()
 
-            cleaned_audio = nr.reduce_noise(
-                y=original_audio,
+            cleaned_audio = reduce_noise(
+                y=audio,
                 sr=self.sample_rate,
                 stationary=False,
                 prop_decrease=self.strength,
@@ -87,53 +102,33 @@ class NoiseSuppressor:
             cleaned_audio = np.asarray(
                 cleaned_audio,
                 dtype=np.float32,
-            )
+            ).reshape(-1)
 
-            cleaned_audio = np.nan_to_num(
-                cleaned_audio,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
+            if cleaned_audio.shape != audio.shape:
+                raise ValueError(
+                    "Noise suppression changed audio length."
+                )
 
-            cleaned_audio = np.clip(
+            if not np.all(np.isfinite(cleaned_audio)):
+                raise ValueError(
+                    "Noise suppression produced invalid audio."
+                )
+
+            np.clip(
                 cleaned_audio,
                 -1.0,
                 1.0,
+                out=cleaned_audio,
             )
 
-            cleaned_rms = self._calculate_rms(
-                cleaned_audio
-            )
+            cleaned_rms = self._calculate_rms(cleaned_audio)
 
-            # Reject suspiciously aggressive processing.
+            # Reject excessive speech attenuation.
             if cleaned_rms < original_rms * 0.08:
-                print(
-                    "[NOISE] Suppression rejected: "
-                    "excessive audio attenuation."
-                )
-
-                return original_audio
-
-            reduction = (
-                1.0 - cleaned_rms / original_rms
-            ) * 100
-
-            print(
-                f"[NOISE] Suppression completed | "
-                f"RMS change: {reduction:.1f}%"
-            )
+                return audio
 
             return cleaned_audio
 
         except Exception as error:
-
-            print(
-                f"[NOISE] Suppression failed: {error}"
-            )
-
-            print(
-                "[NOISE] Using original audio."
-            )
-
-            return original_audio
+            print(f"[NOISE] Suppression failed: {error}")
+            return audio

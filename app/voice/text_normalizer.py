@@ -2,50 +2,74 @@ import re
 import html
 
 
+# Precompiled patterns for faster repeated processing.
+_CODE_BLOCK = re.compile(r"```[\s\S]*?```")
+_INLINE_CODE = re.compile(r"`([^`]+)`")
+_MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s*", re.MULTILINE)
+_BLOCKQUOTE = re.compile(r"^\s*>\s?", re.MULTILINE)
+_LIST_MARKER = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+", re.MULTILINE)
+
+_BOLD = re.compile(r"\*\*(.*?)\*\*|__(.*?)__", re.DOTALL)
+_ITALIC = re.compile(
+    r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)"
+    r"|(?<!_)_(?!\s)(.+?)(?<!\s)_(?!_)",
+    re.DOTALL,
+)
+
+_HTML_TAG = re.compile(r"<[^>]*>")
+_DECORATIVE = re.compile(r"[#*_~`]")
+_WHITESPACE = re.compile(r"[ \t]+")
+_NEWLINES = re.compile(r"\s*\n+\s*")
+
+
 def normalize_for_speech(text: str) -> str:
-    if not text:
+    """
+    Convert Markdown and HTML-containing text into
+    clean speech-friendly plain text.
+
+    Preserves readable content while removing
+    formatting that should not be spoken.
+    """
+
+    if not isinstance(text, str) or not text:
         return ""
 
     text = html.unescape(text)
 
-    # Remove code blocks.
-    text = re.sub(r"```[\s\S]*?```", " ", text)
+    # Remove code blocks completely.
+    text = _CODE_BLOCK.sub(" ", text)
 
-    # Remove inline code formatting, preserve its content.
-    text = re.sub(r"`([^`]+)`", r"\1", text)
+    # Preserve inline code content.
+    text = _INLINE_CODE.sub(r"\1", text)
 
-    # Convert Markdown links to their readable labels.
-    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # Preserve readable Markdown link labels.
+    text = _MARKDOWN_LINK.sub(r"\1", text)
 
-    # Remove Markdown headings.
-    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
+    # Remove Markdown structural markers.
+    text = _HEADING.sub("", text)
+    text = _BLOCKQUOTE.sub("", text)
+    text = _LIST_MARKER.sub("", text)
 
-    # Remove blockquote markers.
-    text = re.sub(r"^\s*>\s?", "", text, flags=re.MULTILINE)
-
-    # Remove bullet and numbered-list markers.
-    text = re.sub(
-        r"^\s*(?:[-*+]|\d+[.)])\s+",
-        "",
+    # Preserve content inside emphasis formatting.
+    text = _BOLD.sub(
+        lambda match: match.group(1) or match.group(2),
         text,
-        flags=re.MULTILINE,
     )
 
-    # Preserve text inside brackets and parentheses.
-    # Remove only the surrounding formatting symbols.
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text, flags=re.DOTALL)
-    text = re.sub(r"__(.*?)__", r"\1", text, flags=re.DOTALL)
-    text = re.sub(r"(?<!\*)\*(?!\s)(.*?)\*(?!\*)", r"\1", text, flags=re.DOTALL)
-    text = re.sub(r"(?<!_)_(?!\s)(.*?)_(?!_)", r"\1", text, flags=re.DOTALL)
+    text = _ITALIC.sub(
+        lambda match: match.group(1) or match.group(2),
+        text,
+    )
 
     # Remove HTML tags.
-    text = re.sub(r"<[^>]+>", " ", text)
+    text = _HTML_TAG.sub(" ", text)
 
-    # Remove decorative symbols that should not be spoken.
-    text = re.sub(r"[#*_~`]", "", text)
+    # Remove remaining decorative Markdown characters.
+    text = _DECORATIVE.sub("", text)
 
-    # Normalize whitespace.
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n+", " ", text)
+    # Normalize whitespace and line breaks.
+    text = _WHITESPACE.sub(" ", text)
+    text = _NEWLINES.sub(" ", text)
 
     return text.strip()

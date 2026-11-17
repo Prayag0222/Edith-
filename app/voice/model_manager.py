@@ -1,77 +1,97 @@
+from threading import Lock
+
+
 class WhisperModelManager:
     """
     Manages Whisper model loading and caching.
 
-    Models:
+    CPU:
+        small + int8
 
-        CPU:
-            small + int8
+    GPU:
+        medium + float16
 
-        GPU:
-            medium + float16
-
-    Whisper and Faster-Whisper are imported lazily so that
-    EDITH does not initialize the Whisper stack during startup.
+    Models are loaded lazily and cached.
+    Thread-safe loading prevents duplicate initialization.
     """
 
     def __init__(self):
         self.cpu_model = None
         self.gpu_model = None
 
-    def get_cpu_model(self):
-        """
-        Return the cached CPU Whisper model.
+        self._cpu_lock = Lock()
+        self._gpu_lock = Lock()
 
-        The model is loaded only when it is first requested.
-        """
+    # --------------------------------------------------
+    # CPU MODEL
+    # --------------------------------------------------
+
+    def get_cpu_model(self):
+        """Return the cached CPU Whisper model."""
 
         if self.cpu_model is not None:
             return self.cpu_model
 
-        from faster_whisper import WhisperModel
+        with self._cpu_lock:
+            # Check again after acquiring the lock.
+            if self.cpu_model is not None:
+                return self.cpu_model
 
-        print("[STT] Loading small model on CPU...")
+            from faster_whisper import WhisperModel
 
-        self.cpu_model = WhisperModel(
-            "small",
-            device="cpu",
-            compute_type="int8",
-            local_files_only=True,
-        )
+            print("[STT] Loading small model on CPU...")
 
-        print("[STT] CPU small model ready.")
+            model = WhisperModel(
+                "small",
+                device="cpu",
+                compute_type="int8",
+                local_files_only=True,
+            )
 
-        return self.cpu_model
+            self.cpu_model = model
+
+            print("[STT] CPU small model ready.")
+
+            return self.cpu_model
+
+    # --------------------------------------------------
+    # GPU MODEL
+    # --------------------------------------------------
 
     def get_gpu_model(self):
-        """
-        Return the cached GPU Whisper model.
-
-        The model is loaded only when it is first requested.
-        """
+        """Return the cached GPU Whisper model."""
 
         if self.gpu_model is not None:
             return self.gpu_model
 
-        from faster_whisper import WhisperModel
+        with self._gpu_lock:
+            # Check again after acquiring the lock.
+            if self.gpu_model is not None:
+                return self.gpu_model
 
-        print("[STT] Loading medium model on CUDA...")
+            from faster_whisper import WhisperModel
 
-        self.gpu_model = WhisperModel(
-            "medium",
-            device="cuda",
-            compute_type="float16",
-            local_files_only=True,
-        )
+            print("[STT] Loading medium model on CUDA...")
 
-        print("[STT] CUDA medium model ready.")
+            model = WhisperModel(
+                "medium",
+                device="cuda",
+                compute_type="float16",
+                local_files_only=True,
+            )
 
-        return self.gpu_model
+            self.gpu_model = model
+
+            print("[STT] CUDA medium model ready.")
+
+            return self.gpu_model
+
+    # --------------------------------------------------
+    # MODEL STATUS
+    # --------------------------------------------------
 
     def is_cpu_model_loaded(self) -> bool:
-        """Return True if the CPU model is already loaded."""
         return self.cpu_model is not None
 
     def is_gpu_model_loaded(self) -> bool:
-        """Return True if the GPU model is already loaded."""
         return self.gpu_model is not None
