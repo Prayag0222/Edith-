@@ -104,6 +104,27 @@ class AudioSubscription:
             except queue.Full:
                 pass
 
+    def discard_pending(self) -> int:
+        """
+        Remove audio captured before the next listening session.
+
+        This is important after TTS playback because the microphone
+        continues capturing EDITH's own spoken response.
+
+        Returns the number of discarded audio blocks.
+        """
+        discarded = 0
+
+        while True:
+            try:
+                self._queue.get_nowait()
+                discarded += 1
+            except queue.Empty:
+                break
+
+        return discarded 
+
+
     def __enter__(self):
         return self
 

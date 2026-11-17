@@ -1,0 +1,2178 @@
+EDITH VOICE INTEGRATION SOURCE FILES
+
+
+==================================================
+FILE: app\voice\wake_word.py
+==================================================
+
+import time
+from pathlib import Path
+
+import numpy as np
+import onnxruntime as ort
+import sounddevice as sd
+
+from openwakeword.utils import AudioFeatures
+
+
+class WakeWordDetector:
+    """
+    Low-latency EDITH wake-word detector.
+
+    Features:
+        - Frozen custom ONNX wake-word model
+        - Efficient NumPy circular audio buffer
+        - Reduced detection latency
+        - RMS-based silence filtering
+        - Optimized ONNX inference
+        - No unnecessary terminal logging
+    """
+
+    WINDOW_SECONDS = 2
+    COOLDOWN_SECONDS = 2.0
+
+    def __init__(
+        self,
+        wake_word: str = "hey_edith",
+        sample_rate: int = 16000,
+        chunk_size: int = 8000,
+        threshold: float = 0.90,
+        min_rms: float = 30.0,
+    ):
+        if sample_rate <= 0:
+            raise ValueError("Sample rate must be positive.")
+
+        if chunk_size <= 0:
+            raise ValueError("Chunk size must be positive.")
+
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("Threshold must be between 0 and 1.")
+
+        if min_rms < 0:
+            raise ValueError("Minimum RMS cannot be negative.")
+
+        self.wake_word = wake_word
+        self.sample_rate = sample_rate
+        self.chunk_size = chunk_size
+        self.threshold = threshold
+        self.min_rms = min_rms
+
+        self.window_size = (
+            self.sample_rate * self.WINDOW_SECONDS
+        )
+
+        self.cooldown_seconds = self.COOLDOWN_SECONDS
+        self.last_detection_time = 0.0
+
+        # --------------------------------------------------
+        # MODEL PATHS
+        # --------------------------------------------------
+
+        project_root = Path(__file__).resolve().parents[2]
+        model_dir = project_root / "models" / "wakeword"
+
+        wake_model_path = model_dir / "hey_edith.onnx"
+        melspec_path = model_dir / "melspectrogram.onnx"
+        embedding_path = model_dir / "embedding_model.onnx"
+
+        for file_path in (
+            wake_model_path,
+            melspec_path,
+            embedding_path,
+        ):
+            if not file_path.is_file():
+                raise FileNotFoundError(
+                    f"Required wake-word model not found: {file_path}"
+                )
+
+        # --------------------------------------------------
+        # ONNX SESSION
+        # --------------------------------------------------
+
+        session_options = ort.SessionOptions()
+
+        session_options.execution_mode = (
+            ort.ExecutionMode.ORT_SEQUENTIAL
+        )
+
+        session_options.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
+
+        session_options.intra_op_num_threads = 1
+        session_options.inter_op_num_threads = 1
+
+        self.session = ort.InferenceSession(
+            str(wake_model_path),
+            sess_options=session_options,
+            providers=["CPUExecutionProvider"],
+        )
+
+        self.input_name = self.session.get_inputs()[0].name
+
+        # --------------------------------------------------
+        # AUDIO FEATURES
+        # --------------------------------------------------
+
+        self.features = AudioFeatures(
+            melspec_model_path=str(melspec_path),
+            embedding_model_path=str(embedding_path),
+        )
+
+        # --------------------------------------------------
+        # NUMPY CIRCULAR BUFFER
+        # --------------------------------------------------
+
+        self.audio_buffer = np.zeros(
+            self.window_size,
+            dtype=np.int16,
+        )
+
+        self._write_position = 0
+        self._samples_collected = 0
+
+    # --------------------------------------------------
+    # BUFFER MANAGEMENT
+    # --------------------------------------------------
+
+    def _add_audio(self, chunk: np.ndarray):
+        """
+        Add incoming audio to the circular buffer.
+        """
+
+        chunk = np.asarray(
+            chunk,
+            dtype=np.int16,
+        ).reshape(-1)
+
+        if chunk.size == 0:
+            return
+
+        chunk_size = chunk.size
+
+        if chunk_size >= self.window_size:
+
+            self.audio_buffer[:] = chunk[-self.window_size:]
+
+            self._write_position = 0
+            self._samples_collected = self.window_size
+
+            return
+
+        end_position = self._write_position + chunk_size
+
+        if end_position <= self.window_size:
+
+            self.audio_buffer[
+                self._write_position:end_position
+            ] = chunk
+
+        else:
+
+            first_part = self.window_size - self._write_position
+
+            self.audio_buffer[
+                self._write_position:
+            ] = chunk[:first_part]
+
+            self.audio_buffer[
+                :chunk_size - first_part
+            ] = chunk[first_part:]
+
+        self._write_position = (
+            end_position % self.window_size
+        )
+
+        self._samples_collected = min(
+            self._samples_collected + chunk_size,
+            self.window_size,
+        )
+
+    def _get_audio_window(self) -> np.ndarray:
+        """
+        Return chronological audio from the circular buffer.
+        """
+
+        if self._write_position == 0:
+            return self.audio_buffer.copy()
+
+        return np.concatenate(
+            (
+                self.audio_buffer[self._write_position:],
+                self.audio_buffer[:self._write_position],
+            )
+        )
+
+    # --------------------------------------------------
+    # AUDIO VALIDATION
+    # --------------------------------------------------
+
+    def _calculate_rms(self, audio: np.ndarray) -> float:
+
+        audio_float = audio.astype(
+            np.float32,
+            copy=False,
+        )
+
+        return float(
+            np.sqrt(
+                np.mean(
+                    audio_float * audio_float
+                )
+            )
+        )
+
+    # --------------------------------------------------
+    # WAKE WORD INFERENCE
+    # --------------------------------------------------
+
+    def _detect(self, audio: np.ndarray) -> float:
+        """
+        Run embedding extraction and ONNX inference.
+        """
+
+        clip = audio[np.newaxis, :]
+
+        embedded = self.features.embed_clips(
+            clip,
+            batch_size=1,
+        )
+
+        embedded = np.asarray(
+            embedded,
+            dtype=np.float32,
+        )
+
+        if embedded.ndim != 3 or embedded.shape[1] < 16:
+            return 0.0
+
+        n = embedded.shape[1]
+
+        start = max(
+            0,
+            (n - 16) // 2,
+        )
+
+        model_input = embedded[
+            :,
+            start:start + 16,
+            :,
+        ]
+
+        if model_input.shape[1] != 16:
+            return 0.0
+
+        output = self.session.run(
+            None,
+            {
+                self.input_name: model_input,
+            },
+        )[0]
+
+        output = np.asarray(
+            output,
+            dtype=np.float32,
+        )
+
+        if output.size == 0:
+            return 0.0
+
+        score = float(output.reshape(-1)[0])
+
+        if not np.isfinite(score):
+            return 0.0
+
+        return score
+
+    # --------------------------------------------------
+    # MAIN WAKE WORD LOOP
+    # --------------------------------------------------
+
+    def wait_for_wake_word(self) -> bool:
+
+        self.audio_buffer.fill(0)
+
+        self._write_position = 0
+        self._samples_collected = 0
+
+        with sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=self.chunk_size,
+        ) as stream:
+
+            while True:
+
+                audio_data, overflowed = stream.read(
+                    self.chunk_size
+                )
+
+                if overflowed:
+                    continue
+
+                chunk = np.asarray(
+                    audio_data,
+                    dtype=np.int16,
+                ).reshape(-1)
+
+                self._add_audio(chunk)
+
+                if self._samples_collected < self.window_size:
+                    continue
+
+                audio = self._get_audio_window()
+
+                rms = self._calculate_rms(audio)
+
+                # Reject low-level background noise.
+                if rms < self.min_rms:
+                    continue
+
+                score = self._detect(audio)
+
+                if score < self.threshold:
+                    continue
+
+                now = time.monotonic()
+
+                if (
+                    now - self.last_detection_time
+                    < self.cooldown_seconds
+                ):
+                    continue
+
+                self.last_detection_time = now
+
+                print(
+                    f"\n[WAKE] Hey EDITH detected "
+                    f"| Score: {score:.4f}"
+                )
+
+                return True
+
+    # --------------------------------------------------
+    # CLEANUP
+    # --------------------------------------------------
+
+    def reset(self):
+
+        self.audio_buffer.fill(0)
+
+        self._write_position = 0
+        self._samples_collected = 0
+
+
+==================================================
+FILE: app\voice\stt.py
+==================================================
+
+import os
+from typing import Optional, Union
+
+import numpy as np
+
+from app.voice.cuda_runtime import setup_cuda_runtime
+from app.voice.adaptive_engine import AdaptiveVoiceEngine
+from app.voice.audio import AudioRecorder
+from app.voice.model_manager import WhisperModelManager
+from app.voice.noise_suppression import NoiseSuppressor
+from app.voice.task_classifier import VoiceTaskClassifier
+
+
+# Initialize CUDA runtime once when this module loads.
+setup_cuda_runtime()
+
+
+class SpeechToText:
+    """
+    EDITH Speech-to-Text engine.
+
+    Features:
+        - Adaptive CPU/GPU model selection
+        - Lazy Whisper model loading
+        - Cached model reuse
+        - Direct NumPy audio transcription
+        - Noise suppression
+        - Voice activity detection
+        - Task classification
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        channels: int = 1,
+        silence_duration: float = 1.5,
+        max_recording_seconds: float = 20.0,
+        vad_aggressiveness: int = 2,
+    ):
+        self.sample_rate = sample_rate
+
+        self.audio_recorder = AudioRecorder(
+            sample_rate=sample_rate,
+            channels=channels,
+            silence_duration=silence_duration,
+            max_recording_seconds=max_recording_seconds,
+            vad_aggressiveness=vad_aggressiveness,
+        )
+
+        self.noise_suppressor = NoiseSuppressor(
+            sample_rate=sample_rate,
+        )
+
+        self.adaptive_engine = AdaptiveVoiceEngine()
+        self.model_manager = WhisperModelManager()
+        self.task_classifier = VoiceTaskClassifier()
+
+    # --------------------------------------------------
+    # MODEL SELECTION
+    # --------------------------------------------------
+
+    def _get_model(self):
+        decision = self.adaptive_engine.get_decision(
+            task_type="conversation",
+            gpu_model_loaded=self.model_manager.is_gpu_model_loaded(),
+        )
+
+        if (
+            decision.device == "cuda"
+            and decision.model_size == "medium"
+        ):
+            model = self.model_manager.get_gpu_model()
+        else:
+            model = self.model_manager.get_cpu_model()
+
+        return model, decision
+
+    # --------------------------------------------------
+    # TRANSCRIPTION
+    # --------------------------------------------------
+
+    def _transcribe(
+        self,
+        audio: Union[str, np.ndarray],
+    ) -> Optional[dict]:
+
+        model, decision = self._get_model()
+
+        segments, info = model.transcribe(
+            audio,
+            beam_size=5,
+            language=None,
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": 500,
+            },
+            condition_on_previous_text=False,
+        )
+
+        # faster-whisper generates segments lazily.
+        # Consume them once.
+        text_parts = []
+
+        for segment in segments:
+            text = segment.text.strip()
+
+            if text:
+                text_parts.append(text)
+
+        text = " ".join(text_parts).strip()
+
+        if not text:
+            return None
+
+        classification = self.task_classifier.classify(text)
+
+        return {
+            "text": text,
+            "language": info.language,
+            "language_probability": info.language_probability,
+            "model": decision.model_size,
+            "device": decision.device,
+            "compute_type": decision.compute_type,
+            "reason": decision.reason,
+            "task_type": classification.task_type,
+            "classification_confidence": classification.confidence,
+        }
+
+    # --------------------------------------------------
+    # FILE TRANSCRIPTION
+    # --------------------------------------------------
+
+    def transcribe_file(self, audio_path: str) -> Optional[dict]:
+        """
+        Transcribe an existing audio file.
+
+        Preserves the existing public interface.
+        """
+
+        if not os.path.isfile(audio_path):
+            raise FileNotFoundError(
+                f"Audio file not found: {audio_path}"
+            )
+
+        return self._transcribe(audio_path)
+
+    # --------------------------------------------------
+    # LIVE LISTENING
+    # --------------------------------------------------
+
+    def listen(self) -> Optional[dict]:
+        """
+        Record, suppress noise and transcribe speech.
+
+        Uses NumPy audio directly instead of creating
+        and reopening a temporary WAV file.
+        """
+
+        audio = self.audio_recorder.record_until_silence()
+
+        if audio is None:
+            return None
+
+        audio = np.asarray(
+            audio,
+            dtype=np.float32,
+        ).reshape(-1)
+
+        if audio.size == 0:
+            return None
+
+        audio = self.noise_suppressor.process(audio)
+
+        if audio.size == 0:
+            return None
+
+        return self._transcribe(audio)
+
+    # --------------------------------------------------
+    # SHUTDOWN
+    # --------------------------------------------------
+
+    def close(self):
+        """Release background resources."""
+
+        self.adaptive_engine.close()
+
+
+==================================================
+FILE: app\voice\adaptive_engine.py
+==================================================
+
+import math
+import subprocess
+import threading
+import time
+
+from dataclasses import dataclass
+
+import ctranslate2
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceDecision:
+    model_size: str
+    device: str
+    compute_type: str
+    reason: str
+
+
+class AdaptiveVoiceEngine:
+    """
+    Resource-aware adaptive Whisper model selection.
+
+    CPU:
+        small + int8
+
+    GPU:
+        medium + float16
+
+    Features:
+        - Asynchronous GPU monitoring
+        - Non-blocking model selection
+        - VRAM-aware decisions
+        - GPU utilization monitoring
+        - Stale statistics protection
+        - Hysteresis to prevent frequent switching
+        - Cached GPU model reuse when resources permit
+    """
+
+    # --------------------------------------------------
+    # RESOURCE CONFIGURATION
+    # --------------------------------------------------
+
+    MIN_FREE_VRAM_MB = 1800.0
+
+    GPU_HIGH_UTILIZATION = 75.0
+    GPU_RESUME_UTILIZATION = 60.0
+
+    # Hysteresis: require extra free VRAM before
+    # switching from CPU to GPU.
+    GPU_ENTRY_VRAM_MB = 2000.0
+
+    MONITOR_INTERVAL = 2.0
+    MONITOR_TIMEOUT = 2.0
+    MAX_STATS_AGE = 5.0
+
+    GPU_QUERY_COMMAND = (
+        "nvidia-smi",
+        "--query-gpu=utilization.gpu,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    )
+
+    FALLBACK_STATS = {
+        "gpu_usage": 100.0,
+        "vram_used": 0.0,
+        "vram_total": 0.0,
+        "vram_free": 0.0,
+        "vram_usage": 100.0,
+        "available": False,
+    }
+
+    # --------------------------------------------------
+    # INITIALIZATION
+    # --------------------------------------------------
+
+    def __init__(self):
+
+        self.gpu_available = self._check_gpu()
+
+        self._stats_lock = threading.Lock()
+        self._decision_lock = threading.Lock()
+
+        self._stop_event = threading.Event()
+
+        self._gpu_stats = self.FALLBACK_STATS.copy()
+
+        self._last_successful_update = 0.0
+
+        # GPU is initially not preferred until
+        # valid resource information is available.
+        self._gpu_preferred = False
+
+        self._monitor_thread = None
+
+        if self.gpu_available:
+
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_gpu,
+                name="EDITH-GPU-Monitor",
+                daemon=True,
+            )
+
+            self._monitor_thread.start()
+
+    # --------------------------------------------------
+    # CUDA DETECTION
+    # --------------------------------------------------
+
+    @staticmethod
+    def _check_gpu() -> bool:
+
+        try:
+            return ctranslate2.get_cuda_device_count() > 0
+
+        except Exception:
+            return False
+
+    # --------------------------------------------------
+    # GPU MONITORING
+    # --------------------------------------------------
+
+    def _monitor_gpu(self):
+        """
+        Continuously monitor GPU resources.
+
+        Runs independently of the main application thread.
+        """
+
+        while not self._stop_event.is_set():
+
+            stats = self._query_gpu_stats()
+
+            if stats["available"]:
+
+                current_time = time.monotonic()
+
+                with self._stats_lock:
+
+                    self._gpu_stats = stats
+                    self._last_successful_update = current_time
+
+                self._update_gpu_preference(stats)
+
+            self._stop_event.wait(
+                self.MONITOR_INTERVAL
+            )
+
+    # --------------------------------------------------
+    # GPU STATISTICS QUERY
+    # --------------------------------------------------
+
+    def _query_gpu_stats(self) -> dict:
+
+        try:
+
+            result = subprocess.run(
+                self.GPU_QUERY_COMMAND,
+                capture_output=True,
+                text=True,
+                timeout=self.MONITOR_TIMEOUT,
+                check=False,
+            )
+
+            if result.returncode != 0:
+                return self.FALLBACK_STATS.copy()
+
+            lines = result.stdout.strip().splitlines()
+
+            if not lines:
+                return self.FALLBACK_STATS.copy()
+
+            values = [
+                float(value.strip())
+                for value in lines[0].split(",")
+            ]
+
+            if len(values) != 3:
+                return self.FALLBACK_STATS.copy()
+
+            gpu_usage, vram_used, vram_total = values
+
+            if not all(
+                math.isfinite(value)
+                for value in values
+            ):
+                return self.FALLBACK_STATS.copy()
+
+            if (
+                gpu_usage < 0
+                or gpu_usage > 100
+                or vram_used < 0
+                or vram_total <= 0
+                or vram_used > vram_total
+            ):
+                return self.FALLBACK_STATS.copy()
+
+            vram_free = vram_total - vram_used
+
+            vram_usage = (
+                vram_used / vram_total
+            ) * 100.0
+
+            return {
+                "gpu_usage": gpu_usage,
+                "vram_used": vram_used,
+                "vram_total": vram_total,
+                "vram_free": vram_free,
+                "vram_usage": vram_usage,
+                "available": True,
+            }
+
+        except (
+            OSError,
+            ValueError,
+            IndexError,
+            subprocess.SubprocessError,
+        ):
+
+            return self.FALLBACK_STATS.copy()
+
+    # --------------------------------------------------
+    # GPU PREFERENCE / HYSTERESIS
+    # --------------------------------------------------
+
+    def _update_gpu_preference(self, stats: dict):
+        """
+        Prevent rapid switching between CPU and GPU.
+
+        GPU entry requires:
+            - At least 2000 MB free VRAM
+            - GPU utilization <= 60%
+
+        GPU exit occurs when:
+            - Free VRAM falls below 1800 MB
+            - GPU utilization reaches 75%
+        """
+
+        gpu_usage = stats["gpu_usage"]
+        vram_free = stats["vram_free"]
+
+        with self._decision_lock:
+
+            if self._gpu_preferred:
+
+                if (
+                    vram_free < self.MIN_FREE_VRAM_MB
+                    or gpu_usage >= self.GPU_HIGH_UTILIZATION
+                ):
+                    self._gpu_preferred = False
+
+            else:
+
+                if (
+                    vram_free >= self.GPU_ENTRY_VRAM_MB
+                    and gpu_usage <= self.GPU_RESUME_UTILIZATION
+                ):
+                    self._gpu_preferred = True
+
+    # --------------------------------------------------
+    # GPU STATISTICS
+    # --------------------------------------------------
+
+    def get_gpu_stats(self) -> dict:
+        """
+        Return the latest GPU snapshot.
+
+        Never launches a subprocess.
+        Never waits for GPU monitoring.
+        """
+
+        with self._stats_lock:
+
+            stats = self._gpu_stats.copy()
+
+            last_update = self._last_successful_update
+
+        if last_update == 0.0:
+
+            stats["available"] = False
+            stats["stale"] = True
+            stats["age_seconds"] = None
+
+            return stats
+
+        age = time.monotonic() - last_update
+
+        stats["age_seconds"] = round(age, 2)
+        stats["stale"] = age > self.MAX_STATS_AGE
+
+        if stats["stale"]:
+            stats["available"] = False
+
+        return stats
+
+    # --------------------------------------------------
+    # MODEL SELECTION
+    # --------------------------------------------------
+
+    def choose_model(
+        self,
+        task_type: str = "conversation",
+        gpu_model_loaded: bool = False,
+    ) -> VoiceDecision:
+
+        # CUDA unavailable.
+        if not self.gpu_available:
+
+            return VoiceDecision(
+                "small",
+                "cpu",
+                "int8",
+                "GPU unavailable",
+            )
+
+        stats = self.get_gpu_stats()
+
+        # No valid or sufficiently recent GPU statistics.
+        if not stats["available"]:
+
+            return VoiceDecision(
+                "small",
+                "cpu",
+                "int8",
+                "GPU statistics unavailable or stale",
+            )
+
+        gpu_usage = stats["gpu_usage"]
+        vram_free = stats["vram_free"]
+
+        # Immediate protection against GPU pressure.
+        if vram_free < self.MIN_FREE_VRAM_MB:
+
+            return VoiceDecision(
+                "small",
+                "cpu",
+                "int8",
+                f"Insufficient free VRAM ({vram_free:.0f} MB)",
+            )
+
+        if gpu_usage >= self.GPU_HIGH_UTILIZATION:
+
+            return VoiceDecision(
+                "small",
+                "cpu",
+                "int8",
+                f"GPU busy ({gpu_usage:.0f}%)",
+            )
+
+        # Apply hysteresis state.
+        with self._decision_lock:
+
+            gpu_preferred = self._gpu_preferred
+
+        if not gpu_preferred:
+
+            return VoiceDecision(
+                "small",
+                "cpu",
+                "int8",
+                "GPU resources not sufficiently idle",
+            )
+
+        # Reuse the already-loaded GPU model.
+        if gpu_model_loaded:
+
+            return VoiceDecision(
+                "medium",
+                "cuda",
+                "float16",
+                "Reusing cached GPU model",
+            )
+
+        # Sufficient GPU resources.
+        return VoiceDecision(
+            "medium",
+            "cuda",
+            "float16",
+            (
+                f"GPU available for {task_type} "
+                f"({gpu_usage:.0f}% utilization, "
+                f"{vram_free:.0f} MB free VRAM)"
+            ),
+        )
+
+    # --------------------------------------------------
+    # PUBLIC INTERFACE
+    # --------------------------------------------------
+
+    def get_decision(
+        self,
+        task_type: str = "conversation",
+        gpu_model_loaded: bool = False,
+    ) -> VoiceDecision:
+
+        return self.choose_model(
+            task_type=task_type,
+            gpu_model_loaded=gpu_model_loaded,
+        )
+
+    # --------------------------------------------------
+    # SHUTDOWN
+    # --------------------------------------------------
+
+    def close(self):
+        """Stop the background GPU monitoring thread."""
+
+        self._stop_event.set()
+
+        if (
+            self._monitor_thread is not None
+            and self._monitor_thread.is_alive()
+        ):
+
+            self._monitor_thread.join(timeout=0.5)
+
+
+==================================================
+FILE: app\voice\tts.py
+==================================================
+
+import queue
+import threading
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import sounddevice as sd
+
+from piper import PiperVoice
+from app.voice.text_normalizer import normalize_for_speech
+
+
+class TextToSpeech:
+    """
+    EDITH Text-to-Speech engine.
+
+    Features:
+        - Lazy-independent Piper voice initialization
+        - Streaming speech synthesis
+        - Bounded producer-consumer audio pipeline
+        - Low-latency audio playback
+        - Thread-safe speech requests
+        - Safe producer cancellation
+        - Reliable resource cleanup
+    """
+
+    AUDIO_QUEUE_SIZE = 4
+    QUEUE_TIMEOUT = 0.1
+
+    def __init__(
+        self,
+        voice_path: str = r"D:\Edith\en_US-lessac-medium.onnx",
+    ):
+        self.voice_path = Path(voice_path)
+
+        if not self.voice_path.is_file():
+            raise FileNotFoundError(
+                f"Piper voice model not found: {self.voice_path}"
+            )
+
+        self._speech_lock = threading.Lock()
+        self._closed = False
+
+        self.output_stream = None
+
+        self.voice = PiperVoice.load(
+            model_path=str(self.voice_path),
+            use_cuda=False,
+        )
+
+        self.sample_rate = self.voice.config.sample_rate
+
+        try:
+            self.output_stream = sd.OutputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="float32",
+                latency="low",
+            )
+
+            self.output_stream.start()
+
+        except Exception:
+            if self.output_stream is not None:
+                try:
+                    self.output_stream.close()
+                except Exception:
+                    pass
+
+            raise
+
+    # --------------------------------------------------
+    # AUDIO PRODUCER
+    # --------------------------------------------------
+
+    def _produce_audio(
+        self,
+        speech_queue,
+        audio_queue,
+        stop_event,
+        errors,
+    ):
+        """
+        Generate speech chunks in a background thread.
+        """
+
+        def put_audio(audio):
+            while not stop_event.is_set():
+
+                try:
+                    audio_queue.put(
+                        audio,
+                        timeout=self.QUEUE_TIMEOUT,
+                    )
+                    return True
+
+                except queue.Full:
+                    continue
+
+            return False
+
+        try:
+            while not stop_event.is_set():
+
+                try:
+                    text = speech_queue.get()
+
+                except Exception:
+                    break
+
+                try:
+                    if text is None:
+                        break
+
+                    if not isinstance(text, str):
+                        continue
+
+                    clean_text = normalize_for_speech(text)
+
+                    if not clean_text:
+                        continue
+
+                    for chunk in self.voice.synthesize(clean_text):
+
+                        if stop_event.is_set():
+                            break
+
+                        audio = chunk.audio_float_array
+
+                        if not isinstance(audio, np.ndarray):
+                            audio = np.asarray(
+                                audio,
+                                dtype=np.float32,
+                            )
+
+                        if audio.size == 0:
+                            continue
+
+                        if not audio.flags.c_contiguous:
+                            audio = np.ascontiguousarray(audio)
+
+                        if not put_audio(audio):
+                            break
+
+                finally:
+                    speech_queue.task_done()
+
+        except Exception as error:
+            errors.append(error)
+
+        finally:
+            # Signal the playback consumer that synthesis ended.
+            if not stop_event.is_set():
+                put_audio(None)
+
+    # --------------------------------------------------
+    # STREAMING PLAYBACK
+    # --------------------------------------------------
+
+    def speak_stream(self, speech_queue):
+        """
+        Synthesize and play speech concurrently.
+
+        The producer generates audio while the consumer
+        plays previously generated chunks.
+        """
+
+        if self._closed:
+            raise RuntimeError("TTS engine is closed.")
+
+        with self._speech_lock:
+
+            if self._closed:
+                raise RuntimeError("TTS engine is closed.")
+
+            output_stream = self.output_stream
+
+            if output_stream is None:
+                raise RuntimeError("Audio output stream is not initialized.")
+
+            audio_queue = queue.Queue(
+                maxsize=self.AUDIO_QUEUE_SIZE
+            )
+
+            stop_event = threading.Event()
+            errors = []
+
+            producer = threading.Thread(
+                target=self._produce_audio,
+                args=(
+                    speech_queue,
+                    audio_queue,
+                    stop_event,
+                    errors,
+                ),
+                name="EDITH-TTS-Producer",
+                daemon=True,
+            )
+
+            producer.start()
+
+            playback_error = None
+
+            try:
+                while True:
+
+                    audio = audio_queue.get()
+
+                    if audio is None:
+                        break
+
+                    audio = np.asarray(
+                        audio,
+                        dtype=np.float32,
+                    ).reshape(-1, 1)
+
+                    if audio.size == 0:
+                        continue
+
+                    output_stream.write(audio)
+
+            except Exception as error:
+                playback_error = error
+
+            finally:
+                if playback_error is not None:
+                    stop_event.set()
+
+                producer.join()
+
+            if playback_error is not None:
+                raise RuntimeError(
+                    f"TTS playback failed: {playback_error}"
+                ) from playback_error
+
+            if errors:
+                raise RuntimeError(
+                    f"Piper synthesis failed: {errors[0]}"
+                ) from errors[0]
+
+    # --------------------------------------------------
+    # SIMPLE SPEECH
+    # --------------------------------------------------
+
+    def speak(self, text: str):
+        """Speak a single text string."""
+
+        if not isinstance(text, str) or not text.strip():
+            return
+
+        speech_queue = queue.Queue()
+
+        speech_queue.put(text)
+        speech_queue.put(None)
+
+        self.speak_stream(speech_queue)
+
+    # --------------------------------------------------
+    # SHUTDOWN
+    # --------------------------------------------------
+
+    def close(self):
+        """Stop playback and release audio resources."""
+
+        with self._speech_lock:
+
+            if self._closed:
+                return
+
+            self._closed = True
+
+            if self.output_stream is not None:
+
+                try:
+                    self.output_stream.stop()
+                finally:
+                    self.output_stream.close()
+
+                self.output_stream = None
+
+
+==================================================
+FILE: app\voice_v2\core\audio_input.py
+==================================================
+
+from __future__ import annotations
+import logging
+import queue
+import threading
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+import sounddevice as sd
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class AudioInputConfig:
+    sample_rate: int = 16000
+    channels: int = 1
+    block_duration_ms: int = 20
+    dtype: str = "float32"
+    device: Optional[int | str] = None
+    input_queue_blocks: int = 100
+    subscriber_queue_blocks: int = 50
+    start: bool = True
+
+    def __post_init__(self):
+        if self.sample_rate <= 0:
+            raise ValueError("sample_rate must be positive")
+        if self.channels != 1:
+            raise ValueError("Phase 1 supports mono input only")
+        if self.block_duration_ms not in (10, 20, 30):
+            raise ValueError("block_duration_ms must be 10, 20, or 30")
+        if self.dtype != "float32":
+            raise ValueError("Only float32 input is supported")
+        if self.input_queue_blocks < 2 or self.subscriber_queue_blocks < 2:
+            raise ValueError("Queue capacities must be at least 2")
+
+    @property
+    def block_size(self) -> int:
+        return self.sample_rate * self.block_duration_ms // 1000
+
+
+@dataclass(frozen=True, slots=True)
+class AudioChunk:
+    samples: np.ndarray
+    sample_rate: int
+    sequence: int
+    captured_at: float
+    overflow_before_capture: bool = False
+
+    @property
+    def duration_seconds(self) -> float:
+        return self.samples.size / self.sample_rate
+
+
+class AudioSubscription:
+    def __init__(self, owner: "AudioInputService", max_blocks: int):
+        self._owner = owner
+        self._queue: queue.Queue[AudioChunk | None] = queue.Queue(maxsize=max_blocks)
+        self._closed = False
+        self.dropped_blocks = 0
+
+    def get(self, timeout: Optional[float] = None) -> Optional[AudioChunk]:
+        if self._closed and self._queue.empty():
+            return None
+        try:
+            item = self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        return item
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._owner.unsubscribe(self)
+
+    def _publish(self, chunk: AudioChunk):
+        if self._closed:
+            return
+        try:
+            self._queue.put_nowait(chunk)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+                self.dropped_blocks += 1
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(chunk)
+            except queue.Full:
+                self.dropped_blocks += 1
+
+    def _signal_closed(self):
+        self._closed = True
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+class AudioInputService:
+    """Own one persistent PortAudio stream and fan out blocks to subscribers."""
+
+    def __init__(self, config: Optional[AudioInputConfig] = None):
+        self.config = config or AudioInputConfig()
+        self._input_queue: queue.Queue[AudioChunk | None] = queue.Queue(
+            maxsize=self.config.input_queue_blocks
+        )
+        self._subscriptions: set[AudioSubscription] = set()
+        self._subscriptions_lock = threading.RLock()
+        self._state_lock = threading.RLock()
+        self._stream: Optional[sd.InputStream] = None
+        self._dispatcher: Optional[threading.Thread] = None
+        self._running = False
+        self._sequence = 0
+        self._callback_overflows = 0
+        self._dropped_input_blocks = 0
+
+        if self.config.start:
+            self.start()
+
+    @property
+    def is_running(self):
+        with self._state_lock:
+            return self._running
+
+    def subscribe(self, max_blocks: Optional[int] = None) -> AudioSubscription:
+        sub = AudioSubscription(self, max_blocks or self.config.subscriber_queue_blocks)
+        with self._subscriptions_lock:
+            self._subscriptions.add(sub)
+        return sub
+
+    def unsubscribe(self, subscription: AudioSubscription):
+        with self._subscriptions_lock:
+            self._subscriptions.discard(subscription)
+
+    def start(self):
+        with self._state_lock:
+            if self._running:
+                return
+            sd.check_input_settings(
+                device=self.config.device,
+                channels=self.config.channels,
+                dtype=self.config.dtype,
+                samplerate=self.config.sample_rate,
+            )
+            self._running = True
+            self._dispatcher = threading.Thread(
+                target=self._dispatch_loop,
+                name="edith-audio-dispatcher",
+                daemon=True,
+            )
+            self._dispatcher.start()
+            try:
+                self._stream = sd.InputStream(
+                    device=self.config.device,
+                    samplerate=self.config.sample_rate,
+                    channels=self.config.channels,
+                    dtype=self.config.dtype,
+                    blocksize=self.config.block_size,
+                    callback=self._audio_callback,
+                )
+                self._stream.start()
+            except Exception:
+                self._running = False
+                self._enqueue_shutdown()
+                self._dispatcher.join(timeout=2)
+                self._dispatcher = None
+                self._stream = None
+                raise
+        logger.info("Microphone started: %s Hz, %s ms blocks",
+                    self.config.sample_rate, self.config.block_duration_ms)
+
+    def _audio_callback(self, indata, frames, time_info, status):
+        # Keep callback work minimal: copy samples and enqueue only.
+        if status and getattr(status, "input_overflow", False):
+            self._callback_overflows += 1
+        samples = np.asarray(indata[:, 0], dtype=np.float32).copy()
+        if samples.size == 0:
+            return
+        samples.setflags(write=False)
+        self._sequence += 1
+        chunk = AudioChunk(
+            samples=samples,
+            sample_rate=self.config.sample_rate,
+            sequence=self._sequence,
+            captured_at=time.monotonic(),
+            overflow_before_capture=bool(status),
+        )
+        try:
+            self._input_queue.put_nowait(chunk)
+        except queue.Full:
+            # Drop oldest audio rather than build up latency.
+            try:
+                self._input_queue.get_nowait()
+                self._dropped_input_blocks += 1
+            except queue.Empty:
+                pass
+            try:
+                self._input_queue.put_nowait(chunk)
+            except queue.Full:
+                self._dropped_input_blocks += 1
+
+    def _dispatch_loop(self):
+        while True:
+            item = self._input_queue.get()
+            if item is None:
+                break
+            with self._subscriptions_lock:
+                subscribers = tuple(self._subscriptions)
+            for sub in subscribers:
+                sub._publish(item)
+        with self._subscriptions_lock:
+            subscribers = tuple(self._subscriptions)
+        for sub in subscribers:
+            sub._signal_closed()
+
+    def _enqueue_shutdown(self):
+        try:
+            self._input_queue.put_nowait(None)
+        except queue.Full:
+            try:
+                self._input_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._input_queue.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def get_stats(self) -> dict:
+        with self._subscriptions_lock:
+            subscribers = tuple(self._subscriptions)
+        return {
+            "running": self.is_running,
+            "sequence": self._sequence,
+            "callback_overflows": self._callback_overflows,
+            "dropped_input_blocks": self._dropped_input_blocks,
+            "input_queue_depth": self._input_queue.qsize(),
+            "subscriber_count": len(subscribers),
+            "subscriber_dropped_blocks": [s.dropped_blocks for s in subscribers],
+        }
+
+    def stop(self):
+        with self._state_lock:
+            if not self._running and self._stream is None:
+                return
+            self._running = False
+            stream, self._stream = self._stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+            finally:
+                stream.close()
+        self._enqueue_shutdown()
+        dispatcher, self._dispatcher = self._dispatcher, None
+        if dispatcher and dispatcher.is_alive():
+            dispatcher.join(timeout=3)
+            if dispatcher.is_alive():
+                logger.warning("Audio dispatcher did not stop within timeout")
+        logger.info("Microphone stopped")
+
+    def __enter__(self):
+        if not self.is_running:
+            self.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop()
+
+
+==================================================
+FILE: app\voice_v2\detection\endpoint_detector.py
+==================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import time
+
+import numpy as np
+
+from app.voice_v2.core.audio_buffer import AudioRingBuffer, AudioAccumulator
+from .silero_vad import SileroVAD
+
+
+@dataclass(frozen=True, slots=True)
+class EndpointConfig:
+    sample_rate: int = 16000
+
+    pre_roll_seconds: float = 0.5
+
+    start_threshold: float = 0.55
+    continue_threshold: float = 0.35
+
+    start_confirm_ms: int = 64
+
+    # Short commands should finish relatively quickly.
+    end_silence_ms: int = 1000
+
+    # Longer speech should tolerate natural thinking/breathing pauses.
+    long_speech_end_silence_ms: int = 3500
+
+    # Switch to long-speech endpointing after this much actual speech.
+    adaptive_after_speech_ms: int = 1200
+
+    min_utterance_ms: int = 120
+
+    max_utterance_seconds: float = 600.0
+
+    adaptive_endpointing: bool = True
+
+    def __post_init__(self):
+        if self.sample_rate not in (8000, 16000):
+            raise ValueError("Endpoint detector supports 8 kHz or 16 kHz")
+
+        if self.pre_roll_seconds < 0:
+            raise ValueError("pre_roll_seconds cannot be negative")
+
+        if not 0 < self.continue_threshold <= self.start_threshold < 1:
+            raise ValueError("Invalid VAD thresholds")
+
+        if self.start_confirm_ms < 0:
+            raise ValueError("start_confirm_ms cannot be negative")
+
+        if self.end_silence_ms <= 0:
+            raise ValueError("end_silence_ms must be positive")
+
+        if self.long_speech_end_silence_ms <= 0:
+            raise ValueError("long_speech_end_silence_ms must be positive")
+
+        if self.adaptive_after_speech_ms < 0:
+            raise ValueError("adaptive_after_speech_ms cannot be negative")
+
+        if self.max_utterance_seconds <= 0:
+            raise ValueError("max_utterance_seconds must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechSegment:
+    audio: np.ndarray
+    sample_rate: int
+    started_at: float
+    ended_at: float
+    speech_duration_seconds: float
+    ended_by: str
+
+    @property
+    def duration_seconds(self) -> float:
+        return self.audio.size / self.sample_rate
+
+
+class AdaptiveEndpointDetector:
+
+    def __init__(
+        self,
+        vad: SileroVAD,
+        config: EndpointConfig | None = None,
+    ):
+        self.vad = vad
+        self.config = config or EndpointConfig()
+
+        if vad.config.sample_rate != self.config.sample_rate:
+            raise ValueError("VAD and endpoint sample rates must match")
+
+        self.pre_roll = AudioRingBuffer(
+            capacity_seconds=max(self.config.pre_roll_seconds, 0.032),
+            sample_rate=self.config.sample_rate,
+        )
+
+        self._pending_audio = np.empty(0, dtype=np.float32)
+
+        self._active = False
+        self._utterance: AudioAccumulator | None = None
+
+        self._start_confirm_samples = 0
+        self._silence_samples = 0
+        self._speech_samples = 0
+
+        self._started_at = 0.0
+
+    @property
+    def is_speaking(self) -> bool:
+        return self._active
+
+    def reset(self):
+        self.pre_roll.clear()
+
+        self._pending_audio = np.empty(0, dtype=np.float32)
+
+        self._active = False
+        self._utterance = None
+
+        self._start_confirm_samples = 0
+        self._silence_samples = 0
+        self._speech_samples = 0
+
+        self._started_at = 0.0
+
+        self.vad.reset()
+
+    def _effective_end_silence_samples(self) -> int:
+
+        duration_ms = self.config.end_silence_ms
+
+        if (
+            self.config.adaptive_endpointing
+            and self._speech_samples >= (
+                self.config.sample_rate
+                * self.config.adaptive_after_speech_ms
+                / 1000
+            )
+        ):
+            duration_ms = self.config.long_speech_end_silence_ms
+
+        return int(
+            self.config.sample_rate * duration_ms / 1000
+        )
+
+    def process(self, audio: np.ndarray) -> SpeechSegment | None:
+
+        samples = np.asarray(
+            audio,
+            dtype=np.float32,
+        ).reshape(-1)
+
+        if samples.size == 0:
+            return None
+
+        if not np.all(np.isfinite(samples)):
+            raise ValueError("Audio contains NaN or infinite values")
+
+        if self._pending_audio.size:
+            combined = np.concatenate(
+                (self._pending_audio, samples)
+            )
+        else:
+            combined = samples
+
+        frame_size = self.vad.frame_size
+
+        complete_samples = (
+            combined.size // frame_size
+        ) * frame_size
+
+        if complete_samples == 0:
+            self._pending_audio = combined.copy()
+            return None
+
+        frames = combined[:complete_samples].reshape(
+            -1,
+            frame_size,
+        )
+
+        # Preserve unprocessed audio instead of discarding it.
+        self._pending_audio = combined[complete_samples:].copy()
+
+        for index, frame in enumerate(frames):
+
+            probabilities = self.vad.process(frame)
+
+            if not probabilities:
+                continue
+
+            probability = probabilities[0]
+
+            frame = frame.copy()
+            frame_samples = frame.size
+
+            self.pre_roll.append(frame)
+
+            is_speech_start = (
+                probability >= self.config.start_threshold
+            )
+
+            is_speech_continue = (
+                probability >= self.config.continue_threshold
+            )
+
+            # WAITING FOR SPEECH
+            if not self._active:
+
+                if is_speech_start:
+                    self._start_confirm_samples += frame_samples
+                else:
+                    self._start_confirm_samples = 0
+
+                required_samples = int(
+                    self.config.sample_rate
+                    * self.config.start_confirm_ms
+                    / 1000
+                )
+
+                if self._start_confirm_samples >= required_samples:
+
+                    self._begin_utterance()
+
+                    if self._utterance is not None:
+                        self._utterance.append(
+                            self.pre_roll.get_audio()
+                        )
+
+                    self._speech_samples = frame_samples
+
+                continue
+
+            # ACTIVE SPEECH
+            if self._utterance is not None:
+                self._utterance.append(frame)
+
+            if is_speech_continue:
+
+                self._silence_samples = 0
+                self._speech_samples += frame_samples
+
+            else:
+
+                self._silence_samples += frame_samples
+
+            # Maximum recording duration
+            if self._utterance and self._utterance.is_full:
+
+                self._pending_audio = combined[
+                    (index + 1) * frame_size:
+                ].copy()
+
+                return self._finish("max_duration")
+
+            # Adaptive endpointing
+            if (
+                self._silence_samples
+                >= self._effective_end_silence_samples()
+            ):
+
+                if (
+                    self._utterance
+                    and self._utterance.duration_seconds * 1000
+                    >= self.config.min_utterance_ms
+                ):
+
+                    self._pending_audio = combined[
+                        (index + 1) * frame_size:
+                    ].copy()
+
+                    return self._finish("silence")
+
+                self._reset_after_short_noise()
+
+        return None
+
+    def _begin_utterance(self):
+
+        self._active = True
+
+        self._started_at = time.monotonic()
+
+        self._utterance = AudioAccumulator(
+            sample_rate=self.config.sample_rate,
+            max_duration_seconds=self.config.max_utterance_seconds,
+        )
+
+        self._silence_samples = 0
+        self._speech_samples = 0
+
+    def _finish(self, reason: str) -> SpeechSegment:
+
+        assert self._utterance is not None
+
+        audio = self._utterance.get_audio()
+
+        ended_at = time.monotonic()
+
+        segment = SpeechSegment(
+            audio=audio,
+            sample_rate=self.config.sample_rate,
+            started_at=self._started_at,
+            ended_at=ended_at,
+            speech_duration_seconds=(
+                self._speech_samples / self.config.sample_rate
+            ),
+            ended_by=reason,
+        )
+
+        self._active = False
+        self._utterance = None
+
+        self._start_confirm_samples = 0
+        self._silence_samples = 0
+        self._speech_samples = 0
+
+        self._started_at = 0.0
+
+        self.vad.reset()
+        self.pre_roll.clear()
+
+        return segment
+
+    def _reset_after_short_noise(self):
+
+        self._active = False
+        self._utterance = None
+
+        self._start_confirm_samples = 0
+        self._silence_samples = 0
+        self._speech_samples = 0
+
+        self._started_at = 0.0
+
+        self.vad.reset()
+        self.pre_roll.clear()
+
+
+==================================================
+FILE: app\voice_v2\detection\silero_vad.py
+==================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import numpy as np
+
+
+@dataclass(frozen=True, slots=True)
+class SileroVADConfig:
+    sample_rate: int = 16000
+    threshold: float = 0.55
+    min_speech_duration_ms: int = 80
+    min_silence_duration_ms: int = 120
+    use_onnx: bool = True
+
+    def __post_init__(self):
+        if self.sample_rate not in (8000, 16000):
+            raise ValueError("Silero VAD supports 8000 or 16000 Hz input")
+        if not 0.0 < self.threshold < 1.0:
+            raise ValueError("threshold must be between 0 and 1")
+        if self.min_speech_duration_ms < 0 or self.min_silence_duration_ms < 0:
+            raise ValueError("Duration settings cannot be negative")
+
+
+class SileroVAD:
+    """
+    Stateful Silero VAD wrapper.
+
+    At 16 kHz, Silero expects 512-sample (32 ms) frames. At 8 kHz it expects
+    256-sample frames. The wrapper buffers arbitrary input chunks and emits
+    one speech probability for each complete model frame.
+    """
+
+    def __init__(self, config: SileroVADConfig | None = None):
+        self.config = config or SileroVADConfig()
+        try:
+            from silero_vad import load_silero_vad
+        except ImportError as exc:
+            raise ImportError(
+                "Install Silero VAD dependencies: "
+                "pip install silero-vad onnxruntime"
+            ) from exc
+
+        self.model = load_silero_vad(onnx=self.config.use_onnx)
+        self.frame_size = 512 if self.config.sample_rate == 16000 else 256
+        self._pending = np.empty(0, dtype=np.float32)
+
+    def reset(self):
+        self._pending = np.empty(0, dtype=np.float32)
+        reset = getattr(self.model, "reset_states", None)
+        if callable(reset):
+            reset()
+
+    def process(self, audio: np.ndarray) -> list[float]:
+        samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if samples.size == 0:
+            return []
+        if not np.all(np.isfinite(samples)):
+            raise ValueError("Audio contains NaN or infinite values")
+
+        if self._pending.size:
+            samples = np.concatenate((self._pending, samples))
+
+        complete_count = samples.size // self.frame_size
+        if complete_count == 0:
+            self._pending = samples.copy()
+            return []
+
+        usable = complete_count * self.frame_size
+        frames = samples[:usable].reshape(complete_count, self.frame_size)
+        self._pending = samples[usable:].copy()
+
+        probabilities: list[float] = []
+        for frame in frames:
+            # Silero's ONNX wrapper accepts a torch tensor in the public API.
+            # Import torch lazily so audio capture does not require it.
+            try:
+                import torch
+                tensor = torch.from_numpy(frame.copy())
+                probability = self.model(tensor, self.config.sample_rate)
+                if hasattr(probability, "item"):
+                    probability = probability.item()
+                probabilities.append(float(probability))
+            except Exception as exc:
+                raise RuntimeError(f"Silero VAD inference failed: {exc}") from exc
+
+        return probabilities
+
+
+==================================================
+FILE: app\voice_v2\recognition\stt_engine.py
+==================================================
+
+import os
+from pathlib import Path
+import threading
+import time
+import numpy as np
+from .base import STTBackend
+from .config import STTConfig
+from .model_manager import WhisperModelManager
+from .transcription_result import TranscriptionResult, TranscriptionSegment
+
+
+def setup_cuda_dll_paths():
+    import sysconfig
+    import os
+
+    if not hasattr(os, "add_dll_directory"):
+        return []
+
+    handles = []
+    site_packages = sysconfig.get_path("purelib")
+    nvidia_path = os.path.join(site_packages, "nvidia")
+
+    dll_directories = [
+        os.path.join(nvidia_path, "cublas", "bin"),
+        os.path.join(nvidia_path, "cudnn", "bin"),
+    ]
+
+    existing_path = os.environ.get("PATH", "")
+    existing_entries = {
+        os.path.normcase(os.path.abspath(entry))
+        for entry in existing_path.split(os.pathsep)
+        if entry
+    }
+    path_entries = []
+    for directory in dll_directories:
+        if os.path.isdir(directory):
+            handles.append(os.add_dll_directory(directory))
+            if os.path.normcase(os.path.abspath(directory)) not in existing_entries:
+                path_entries.append(directory)
+
+    if path_entries:
+        if existing_path:
+            path_entries.append(existing_path)
+        os.environ["PATH"] = os.pathsep.join(path_entries)
+
+    return handles
+
+
+_CUDA_DLL_HANDLES = setup_cuda_dll_paths()
+
+class SpeechToTextEngine(STTBackend):
+    # Accepts completed Phase 3 audio; never opens a microphone or runs VAD.
+    def __init__(self, config=None, model_manager=None, task_classifier=None):
+        self.config = config or STTConfig()
+        self.model_manager = model_manager or WhisperModelManager(self.config)
+        self.task_classifier = task_classifier
+        self._lock = threading.Lock()
+
+    def _prepare_audio(self, audio):
+        a = np.asarray(audio, dtype=np.float32)
+        if a.ndim == 2:
+            a = a.mean(axis=0 if a.shape[0] <= 8 and a.shape[1] > a.shape[0] else 1)
+        elif a.ndim != 1:
+            raise ValueError("Audio must be 1-D mono or 2-D multichannel")
+        a = np.ascontiguousarray(a.reshape(-1), dtype=np.float32)
+        if not a.size: raise ValueError("Audio array is empty")
+        if not np.all(np.isfinite(a)): raise ValueError("Audio contains NaN or infinite values")
+        if float(np.max(np.abs(a))) > 1.5:
+            raise ValueError("Expected normalized float32 waveform approximately in [-1, 1]")
+        return a
+
+    def _classify(self, text):
+        if self.task_classifier is None:
+            try:
+                from app.voice.task_classifier import VoiceTaskClassifier
+                self.task_classifier = VoiceTaskClassifier()
+            except Exception:
+                return "conversation", 0.5, "Default classification"
+        c = self.task_classifier.classify(text)
+        return (getattr(c, "task_type", "unknown"), float(getattr(c, "confidence", 0.0)),
+                str(getattr(c, "reason", "")))
+
+    def _run(self, model, source, language, beam):
+        segments, info = model.transcribe(
+            source, beam_size=beam, language=language, task=self.config.task,
+            vad_filter=self.config.vad_filter,
+            condition_on_previous_text=self.config.condition_on_previous_text)
+        texts, out = [], []
+        # Faster-Whisper returns a lazy generator; consume it exactly once.
+        for s in segments:
+            text = (s.text or "").strip()
+            if text:
+                texts.append(text)
+                out.append(TranscriptionSegment(float(s.start), float(s.end), text))
+        p = getattr(info, "language_probability", None)
+        duration = getattr(info, "duration", None)
+        return (" ".join(texts).strip(), getattr(info, "language", None),
+                float(p) if p is not None else None,
+                float(duration) if duration is not None else None, tuple(out))
+
+    def transcribe(self, audio, *, language=None, beam_size=None):
+        if isinstance(audio, (str, os.PathLike)):
+            path = Path(audio)
+            if not path.is_file(): raise FileNotFoundError(f"Audio file not found: {path}")
+            source, input_duration = str(path), None
+        else:
+            source = self._prepare_audio(audio)
+            input_duration = source.size / self.config.sample_rate
+        beam = self.config.beam_size if beam_size is None else beam_size
+        if beam < 1: raise ValueError("beam_size must be >= 1")
+
+        lock = self._lock if self.config.inference_lock else _NullLock()
+        with lock:
+            model, decision = self.model_manager.get_model()
+            print(f"[STT DEBUG] Selected device: {decision.device}")
+            print(f"[STT DEBUG] Selected model: {decision.model_size}")
+            print(f"[STT DEBUG] Selection reason: {decision.reason}")
+            status = getattr(self.model_manager, "status", None)
+            if callable(status):
+                print(f"[STT DEBUG] Model manager status: {status()}")
+            started = time.perf_counter()
+            try:
+                values = self._run(model, source, language or self.config.language, beam)
+            except Exception as exc:
+                print(f"[STT ERROR] CUDA inference failed: {type(exc).__name__}: {exc}")
+
+                if decision.device != "cuda":
+                    raise
+
+                print("[STT] Falling back to CPU...")
+                model, decision = self.model_manager.get_cpu_model()
+
+                values = self._run(
+                        model,
+                        source,
+                        language or self.config.language,
+                        beam
+                        )
+            elapsed = time.perf_counter() - started
+
+        text, lang, probability, duration, segments = values
+        if not text: return None
+        task_type, confidence, reason = self._classify(text)
+        return TranscriptionResult(
+            text=text, language=lang, language_probability=probability,
+            model_size=decision.model_size, device=decision.device,
+            compute_type=decision.compute_type, selection_reason=decision.reason,
+            processing_seconds=elapsed,
+            audio_duration_seconds=duration if duration is not None else input_duration,
+            task_type=task_type, classification_confidence=confidence,
+            classification_reason=reason, segments=segments)
+
+    def transcribe_file(self, audio_path, *, language=None, beam_size=None):
+        return self.transcribe(audio_path, language=language, beam_size=beam_size)
+
+    def close(self):
+        self.model_manager.close()
+
+class _NullLock:
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+
+
+==================================================
+FILE: app\voice_v2\recognition\config.py
+==================================================
+
+from dataclasses import dataclass
+@dataclass(frozen=True, slots=True)
+class STTConfig:
+    model_size: str = "small"
+    sample_rate: int = 16000
+    device_preference: str = "auto"
+    cpu_compute_type: str = "int8"
+    language: str | None = None
+    task: str = "transcribe"
+    beam_size: int = 5
+    vad_filter: bool = False
+    condition_on_previous_text: bool = False
+    local_files_only: bool = True
+    download_root: str | None = None
+    gpu_min_free_vram_mb: float = 1800.0
+    gpu_max_utilization: float = 75.0
+    inference_lock: bool = True
+    def __post_init__(self):
+        if self.sample_rate not in (8000, 16000, 22050, 44100, 48000): raise ValueError("Unsupported sample rate")
+        if not self.model_size: raise ValueError("model_size cannot be empty")
+        if self.device_preference not in {"auto", "cuda", "cpu"}: raise ValueError("Invalid device_preference")
+        if self.task not in {"transcribe", "translate"}: raise ValueError("Invalid task")
+        if self.beam_size < 1: raise ValueError("beam_size must be >= 1")
+        if self.gpu_min_free_vram_mb < 0: raise ValueError("Invalid VRAM threshold")
+        if not 0 <= self.gpu_max_utilization <= 100: raise ValueError("Invalid GPU utilization threshold")
