@@ -1,13 +1,32 @@
+import logging
 import queue
 import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import sounddevice as sd
 
 from piper import PiperVoice
 from app.voice.text_normalizer import normalize_for_speech
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechChunk:
+    text: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SpeechPosition:
+    start: int
+    end: int
 
 
 class TextToSpeech:
@@ -271,15 +290,22 @@ class TextToSpeech:
 
                 try:
 
-                    text = speech_queue.get()
+                    item = speech_queue.get()
 
                 except Exception:
                     break
 
                 try:
 
-                    if text is None:
+                    if item is None:
                         break
+
+                    speech_position = None
+                    if isinstance(item, SpeechChunk):
+                        text = item.text
+                        speech_position = _SpeechPosition(item.start, item.end)
+                    else:
+                        text = item
 
                     if not isinstance(text, str):
                         continue
@@ -303,6 +329,7 @@ class TextToSpeech:
                     print(f"[TTS] Speaking: {language}")
 
                     # Generate audio incrementally.
+                    position_sent = False
                     for chunk in selected_voice.synthesize(
                         clean_text
                     ):
@@ -343,6 +370,11 @@ class TextToSpeech:
                         if audio.size == 0:
                             continue
 
+                        if not position_sent and speech_position is not None:
+                            if not put_audio(speech_position):
+                                break
+                            position_sent = True
+
                         if not put_audio(audio):
                             break
 
@@ -364,7 +396,11 @@ class TextToSpeech:
     # STREAMING PLAYBACK
     # --------------------------------------------------
 
-    def speak_stream(self, speech_queue):
+    def speak_stream(
+        self,
+        speech_queue,
+        on_speech_progress: Callable[[int, int], None] | None = None,
+    ):
         """
         Synthesize and play speech concurrently.
 
@@ -392,6 +428,8 @@ class TextToSpeech:
 
             stop_event = threading.Event()
             errors = []
+            playback_started = time.perf_counter()
+            first_audio_ms = None
 
             producer = threading.Thread(
                 target=self._produce_audio,
@@ -418,6 +456,16 @@ class TextToSpeech:
                     if audio is None:
                         break
 
+                    if isinstance(audio, _SpeechPosition):
+                        if on_speech_progress is not None:
+                            try:
+                                on_speech_progress(audio.start, audio.end)
+                            except Exception:
+                                logger.exception(
+                                    "Could not update speech-follow UI"
+                                )
+                        continue
+
                     audio = np.asarray(
                         audio,
                         dtype=np.float32,
@@ -425,6 +473,11 @@ class TextToSpeech:
 
                     if audio.size == 0:
                         continue
+
+                    if first_audio_ms is None:
+                        first_audio_ms = (
+                            time.perf_counter() - playback_started
+                        ) * 1000
 
                     output_stream.write(audio)
 
@@ -438,6 +491,16 @@ class TextToSpeech:
                     stop_event.set()
 
                 producer.join()
+                first_audio_label = (
+                    "n/a"
+                    if first_audio_ms is None
+                    else f"{first_audio_ms:.2f}"
+                )
+                logger.info(
+                    "TTS playback timing | first_audio_ms=%s total_ms=%.2f",
+                    first_audio_label,
+                    (time.perf_counter() - playback_started) * 1000,
+                )
 
             if playback_error is not None:
 

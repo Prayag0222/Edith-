@@ -12,6 +12,7 @@ export default function App() {
   const [ui, setUi] = useState({
     state: "SLEEPING",
     response: "",
+    speechRange: null,
     visible: false,
   });
 
@@ -68,6 +69,7 @@ export default function App() {
       <EdithInterface
         state={ui.state}
         response={ui.response}
+        speechRange={ui.speechRange}
         visible={ui.visible}
       />
 

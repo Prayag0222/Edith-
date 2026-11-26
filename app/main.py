@@ -2,6 +2,7 @@ import re
 import queue
 import threading
 import logging
+import time
 from contextlib import ExitStack
 
 import webview
@@ -21,7 +22,7 @@ from app.memory.service import MemoryService
 from app.memory.manager import MemoryManager
 from app.memory.workers.worker_manager import BackgroundMemoryWorker
 
-from app.voice.tts import TextToSpeech
+from app.voice.tts import SpeechChunk, TextToSpeech
 from app.voice_v2.engine import VoiceEngine
 
 from app.ui.desktop_window import EdithDesktopWindow
@@ -38,6 +39,8 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+SPEECH_MAX_BUFFER_CHARS = 120
 
 
 # --------------------------------------------------
@@ -77,9 +80,9 @@ def extract_speech_chunks(buffer: str, final: bool = False):
 
         # Split long text at a word boundary to avoid
         # excessive delay before Piper receives text.
-        if len(buffer) >= 180:
+        if len(buffer) >= SPEECH_MAX_BUFFER_CHARS:
 
-            split_at = buffer.rfind(" ", 0, 180)
+            split_at = buffer.rfind(" ", 0, SPEECH_MAX_BUFFER_CHARS)
 
             if split_at > 0:
 
@@ -100,7 +103,7 @@ def extract_speech_chunks(buffer: str, final: bool = False):
 # TTS WORKER
 # --------------------------------------------------
 
-def speech_worker(tts, speech_queue):
+def speech_worker(tts, speech_queue, on_speech_progress=None):
 
     """
     Run Piper in a separate thread.
@@ -111,7 +114,10 @@ def speech_worker(tts, speech_queue):
 
     try:
 
-        tts.speak_stream(speech_queue)
+        tts.speak_stream(
+            speech_queue,
+            on_speech_progress=on_speech_progress,
+        )
 
     except Exception:
 
@@ -301,7 +307,11 @@ def run_assistant(
 
             worker = threading.Thread(
                 target=speech_worker,
-                args=(tts, speech_queue),
+                args=(
+                    tts,
+                    speech_queue,
+                    ui.desktop.set_speech_progress,
+                ),
                 name="EDITH-TTS-Worker",
                 daemon=True,
             )
@@ -313,6 +323,11 @@ def run_assistant(
             ui.desktop.clear_response()
 
             speech_buffer = ""
+            response_text = ""
+            speech_cursor = 0
+            response_started = time.perf_counter()
+            first_response_ms = None
+            response_chars = 0
 
             speaking_started = False
 
@@ -327,6 +342,17 @@ def run_assistant(
                 ):
 
                     print(chunk, end="", flush=True)
+                    response_text += chunk
+                    response_chars += len(chunk)
+
+                    if first_response_ms is None:
+                        first_response_ms = (
+                            time.perf_counter() - response_started
+                        ) * 1000
+                        logger.info(
+                            "Response first text chunk | elapsed_ms=%.2f",
+                            first_response_ms,
+                        )
 
                     ui.desktop.append_response(chunk)
 
@@ -345,7 +371,21 @@ def run_assistant(
                             ui.set_state("SPEAKING")
                             speaking_started = True
 
-                        speech_queue.put(speech_chunk)
+                        speech_start = response_text.find(
+                            speech_chunk,
+                            speech_cursor,
+                        )
+                        if speech_start < 0:
+                            speech_start = speech_cursor
+                        speech_end = speech_start + len(speech_chunk)
+                        speech_queue.put(
+                            SpeechChunk(
+                                speech_chunk,
+                                speech_start,
+                                speech_end,
+                            )
+                        )
+                        speech_cursor = speech_end
 
                 # Send remaining response text to Piper.
                 remaining_chunks, _ = extract_speech_chunks(
@@ -360,11 +400,38 @@ def run_assistant(
                         ui.set_state("SPEAKING")
                         speaking_started = True
 
-                    speech_queue.put(speech_chunk)
+                    speech_start = response_text.find(
+                        speech_chunk,
+                        speech_cursor,
+                    )
+                    if speech_start < 0:
+                        speech_start = speech_cursor
+                    speech_end = speech_start + len(speech_chunk)
+                    speech_queue.put(
+                        SpeechChunk(
+                            speech_chunk,
+                            speech_start,
+                            speech_end,
+                        )
+                    )
+                    speech_cursor = speech_end
 
                 print("\n")
 
             finally:
+
+                first_text_label = (
+                    "n/a"
+                    if first_response_ms is None
+                    else f"{first_response_ms:.2f}"
+                )
+                logger.info(
+                    "Response stream timing | first_text_ms=%s total_ms=%.2f "
+                    "characters=%d",
+                    first_text_label,
+                    (time.perf_counter() - response_started) * 1000,
+                    response_chars,
+                )
 
                 # Tell Piper that response generation is complete.
                 speech_queue.put(None)

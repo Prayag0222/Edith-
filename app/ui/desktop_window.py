@@ -289,6 +289,11 @@ class EdithDesktopWindow:
     def clear_response(self):
         self._execute_js("window.edithClearResponse()")
 
+    def set_speech_progress(self, start: int, end: int):
+        self._execute_js(
+            f"window.edithSetSpeechProgress({int(start)}, {int(end)})"
+        )
+
     def set_audio_level(self, level: float):
         normalized = max(0.0, min(1.0, float(level)))
         self._execute_js(f"window.edithSetAudioLevel({normalized})")

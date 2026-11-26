@@ -3,7 +3,12 @@ import EdithOrb from "./EdithOrb.jsx";
 import ResponseDisplay from "./ResponseDisplay.jsx";
 import StatusIndicator from "./StatusIndicator.jsx";
 
-export default function EdithInterface({ state, response, visible }) {
+export default function EdithInterface({
+  state,
+  response,
+  speechRange,
+  visible,
+}) {
   return (
     <main
       className={`presence relative isolate flex h-full w-full items-center justify-between overflow-hidden px-6
@@ -13,7 +18,11 @@ export default function EdithInterface({ state, response, visible }) {
       {/* LEFT: Intelligence & Communication */}
       <section className="presence-copy z-10 flex flex-col justify-center">
         <StatusIndicator state={state} />
-        <ResponseDisplay response={response} state={state} />
+        <ResponseDisplay
+          response={response}
+          state={state}
+          speechRange={speechRange}
+        />
         <AudioVisualizer state={state} />
       </section>
 

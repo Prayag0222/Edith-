@@ -24,10 +24,13 @@ EDITH's voice system implements this local voice interaction loop:
 4.  Detect speech boundaries with Silero VAD and adaptive endpointing.
 5.  Transcribe the completed audio using Faster-Whisper.
 6.  Pass text to the existing assistant, conversation and LLM pipeline.
-7.  Stream generated response text to Piper TTS.
-8.  Remove microphone audio captured during EDITH's own playback.
-9.  Continue the conversation without another wake phrase.
-10. Return to wake-word mode after seven seconds without new speech.
+7.  Stream generated response text to the UI while collecting speech-sized
+    chunks for Piper.
+8.  Play each chunk and report its text range to the UI when its audio
+    begins.
+9.  Remove microphone audio captured during EDITH's own playback.
+10. Continue the conversation without another wake phrase.
+11. Return to wake-word mode after seven seconds without new speech.
 
 The central architectural decision is **one persistent microphone
 stream**. Wake detection and speech capture use audio distributed by the
@@ -51,6 +54,13 @@ VAD gate plus two-hit debounce for wake detection. Focused runtime checks
 are recorded in Section 16. The repository test suite and live microphone
 accuracy were not independently run for that update.
 
+The November 2026 response update keeps the existing Ollama model and
+options, lowers the TTS text-buffer threshold from 180 to 120 characters,
+and connects Piper playback progress to the UI. Section 12 explains the
+timing logs and how the spoken phrase is located without hiding the full
+response. Focused tests and browser simulation are recorded in Section
+16.8; live microphone-to-audible-response latency was not measured.
+
 This is evidence from the user's machine and tests, not a guarantee
 across every microphone, room or acoustic environment.
 
@@ -69,6 +79,8 @@ across every microphone, room or acoustic environment.
 -   `VoiceEngine` wake/conversation state.
 -   Seven-second speech-start timeout.
 -   Existing Piper TTS orchestration in `main.py`.
+-   Phrase-level Piper playback progress and UI follow behavior.
+-   Stage-oriented Ollama, response-stream and first-audio timing logs.
 -   Post-TTS audio cleanup.
 -   Startup, shutdown, diagnostics and test procedure.
 
@@ -772,21 +784,67 @@ Voice Engine v2 does not replace Piper; `main.py` coordinates it.
 
 ## 12.2 Streaming text to speech
 
-`edith.respond_stream(...)` yields response text incrementally.
-`extract_speech_chunks()` accumulates text and emits manageable pieces:
+`edith.respond_stream(...)` yields response text incrementally. Each text
+fragment is appended to the UI immediately and also added to a TTS buffer.
+`extract_speech_chunks()` emits manageable pieces:
 
 -   Prefer sentence boundaries after punctuation.
--   If a buffer reaches roughly 180 characters, split at a nearby word
+-   If a buffer reaches 120 characters, split at a nearby word
     boundary.
 -   Flush remaining text when generation finishes.
 
 This lets Piper start before the entire LLM response has been generated.
+The 120-character threshold controls when text is handed to Piper; it does
+not change the Ollama model, prompt, or generation options.
 
-## 12.3 Worker queue ordering
+## 12.3 Playback-follow synchronization and timing
 
-A worker thread calls `tts.speak_stream(speech_queue)`. The main thread
-enqueues chunks. At the end it adds `None` as the sentinel, then waits
-for:
+The spoken phrase is synchronized to the response text by character range,
+not by trying to infer playback position from elapsed time:
+
+1. `main.py` keeps the complete response string as LLM fragments arrive.
+   When a TTS chunk is queued, it records that chunk's `start` and `end`
+   offsets in a `SpeechChunk`.
+2. The TTS producer synthesizes the text with the existing Piper voice.
+   Immediately before it queues the first non-empty audio block for that
+   text chunk, it queues a matching playback-position marker.
+3. The playback consumer reads the marker before writing that audio block
+   and calls the progress callback with the text offsets.
+4. `EdithDesktopWindow` forwards the range to
+   `window.edithSetSpeechProgress(start, end)`. The UI bridge includes it
+   in the React snapshot.
+5. `ResponseDisplay` highlights that phrase inside the complete response
+   and smoothly scrolls it into view. The response is not replaced by a
+   partial transcript.
+
+Automatic following pauses when the reader scrolls away from the latest
+content; scrolling back near the bottom resumes it. The range is
+phrase/chunk-level, not word- or phoneme-level. It remains on the current
+phrase until audio for the next chunk begins and is cleared with the
+response or when a new listening turn starts.
+
+The logs expose separate checkpoints for diagnosis:
+
+| Log message | What it measures |
+|---|---|
+| `Ollama stream timing` | Time from the prepared HTTP request to first non-empty model text, plus elapsed stream wall time and character count |
+| `Response first text chunk` | Time from starting `edith.respond_stream(...)` to the first response text; includes application-side preparation before the first yielded text |
+| `Response stream timing` | First-text time and total response-stream wall time |
+| `TTS playback timing` | Time from the TTS stream worker starting to the first non-empty audio block, plus total playback wall time |
+| STT timing logs | Existing `denoise_ms` and `stt_ms` values for the recognition path |
+
+These are diagnostic checkpoints, not values to add together: response
+generation and TTS synthesis/playback overlap. `first_audio_ms` ends just
+before the first block is written to the output stream; it does not measure
+the exact time sound reaches the listener. A real microphone-to-audible
+latency measurement requires a live run on the target machine.
+
+## 12.4 Worker queue ordering
+
+A worker thread calls
+`tts.speak_stream(speech_queue, on_speech_progress=...)`. The main thread
+enqueues `SpeechChunk` items. At the end it adds `None` as the sentinel,
+then waits for:
 
 1.  `speech_queue.join()`
 2.  `worker.join()`
@@ -796,7 +854,7 @@ Only after both waits does it call `voice.prepare_for_next_turn()`.
 This ordering is essential. Cleanup must happen after Piper has
 completed playback.
 
-## 12.4 Lifecycle voice commands
+## 12.5 Lifecycle voice commands
 
 Commands are normalized for case, punctuation, and repeated whitespace, and
 matched exactly before LLM generation:
@@ -1058,6 +1116,29 @@ observed final-word self-transcription issue.
 -   [ ] A second launch is rejected without opening another microphone.
 -   [ ] Voice, TTS and memory worker close cleanly.
 -   [ ] No unexpected audio overflow/drop growth.
+-   [ ] Full response remains visible while Piper speaks.
+-   [ ] Spoken phrase highlight follows new TTS chunks.
+-   [ ] Manual transcript scrolling pauses automatic following.
+-   [ ] Timing logs are captured for a real turn before comparing latency.
+
+## 16.8 November 2026 response timing and UI-follow checks
+
+-   **PASS:** Five focused Python tests passed, including TTS playback
+    progress ordering, main lifecycle tests and desktop-window lifecycle
+    tests.
+-   **PASS:** `npm run build` completed for the React/Vite UI.
+-   **PASS:** Browser simulation confirmed that the complete response
+    remains visible, the supplied phrase range is highlighted and
+    followed, and manual scrolling is respected.
+-   **PASS:** Changed Python files passed syntax checks and
+    `git diff --check`.
+-   **NOT RUN:** Live microphone-to-audible-response latency, real Piper
+    playback synchronization and acoustic performance were not measured
+    in that verification session.
+
+The fake-output TTS test verifies that the progress callback is received
+before the matching first audio write. It does not validate sound-device
+latency or human-perceived synchronization.
 
 # 17. Troubleshooting
 
@@ -1117,6 +1198,24 @@ The active voice path explicitly requests CPU/int8 with six threads.
 Inspect the STT timing logs and model-manager decision. Generic GPU
 selection in `WhisperModelManager` is not used by
 `SpeechToTextEngine.transcribe()`.
+
+## L. First response audio is delayed or the UI does not follow speech
+
+Compare `Ollama stream timing`, `Response first text chunk`, and `TTS
+playback timing` from the same turn. They measure different, partly
+overlapping stages; the TTS worker starts before response generation is
+finished. If first audio is delayed, check when the first punctuation or
+120-character word-boundary chunk reaches the speech queue, then inspect
+Piper synthesis and output-stream behavior. Do not change the LLM model or
+options based only on one timing.
+
+If the UI does not follow the active phrase, confirm that the rebuilt
+`edith-ui/dist/` is being loaded, that
+`window.edithSetSpeechProgress` is registered, and that the queued item is
+a `SpeechChunk` with offsets into the accumulated response. A range is
+sent only when Piper produces the first non-empty audio block for that
+chunk. Following intentionally pauses while the reader is scrolled away
+from the bottom.
 
 ## H. Audio overflows or drops
 

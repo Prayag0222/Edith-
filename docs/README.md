@@ -8,10 +8,12 @@ a document and the checked-out code differ.
 
 - [EDITH UI — Technical Architecture & Developer Guide](./EDITH_UI_Technical_Documentation.md)  
   React/Vite build, pywebview integration, JavaScript bridge, UI state
-  lifecycle, components, Canvas rendering, and troubleshooting.
+  lifecycle, spoken-phrase highlighting and scroll-follow, components,
+  Canvas rendering, and troubleshooting.
 - [EDITH Voice System — Technical Architecture & Developer Documentation](./EDITH_Voice_System_Technical_Documentation.md)  
   Microphone capture, wake-word flow, STT, conversation lifecycle, TTS
-  coordination, CPU denoising, wake-word noise gating, and troubleshooting.
+  coordination and playback progress, response timing, CPU denoising,
+  wake-word noise gating, and troubleshooting.
 - [EDITH Memory System — Technical Architecture, Data Flow & Debugging Guide](./EDITH_Memory_System_Technical_Documentation.md)  
   Conversation and structured memory, retrieval, persistence, and
   debugging guidance.

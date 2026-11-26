@@ -1,11 +1,16 @@
 import json
+import logging
 import threading
+import time
 import urllib.error
 import urllib.request
 
 from app.core.config import settings
 from app.core.identity import EDITH_IDENTITY
 from app.core.behavior import EDITH_BEHAVIOR
+
+
+logger = logging.getLogger(__name__)
 
 
 class OllamaClient:
@@ -147,6 +152,9 @@ COMMUNICATION RULES
         )
 
         received_content = False
+        started = time.perf_counter()
+        first_content_ms = None
+        output_chars = 0
 
         try:
             with urllib.request.urlopen(
@@ -172,6 +180,11 @@ COMMUNICATION RULES
 
                     if content:
                         received_content = True
+                        output_chars += len(content)
+                        if first_content_ms is None:
+                            first_content_ms = (
+                                time.perf_counter() - started
+                            ) * 1000
                         yield content
 
                     if result.get("done", False):
@@ -187,6 +200,19 @@ COMMUNICATION RULES
         except (RuntimeError, json.JSONDecodeError, KeyError, TypeError):
             if not received_content:
                 yield "I encountered an error processing the local AI response."
+        finally:
+            first_content_label = (
+                "n/a"
+                if first_content_ms is None
+                else f"{first_content_ms:.2f}"
+            )
+            logger.info(
+                "Ollama stream timing | first_content_ms=%s elapsed_ms=%.2f "
+                "characters=%d",
+                first_content_label,
+                (time.perf_counter() - started) * 1000,
+                output_chars,
+            )
 
     def generate(
         self,

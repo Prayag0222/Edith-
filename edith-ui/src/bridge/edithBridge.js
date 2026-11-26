@@ -18,11 +18,13 @@ export const edithLiveStore = {
 let uiListeners = new Set();
 let currentState = "SLEEPING";
 let currentResponse = "";
+let currentSpeechRange = null;
 
 function emitUI() {
   const snapshot = {
     state: currentState,
     response: currentResponse,
+    speechRange: currentSpeechRange,
     visible: currentState !== "SLEEPING",
   };
   uiListeners.forEach((listener) => listener(snapshot));
@@ -43,6 +45,7 @@ export function setEdithState(nextState) {
 
   if (normalized === "LISTENING" && previousState !== "LISTENING") {
     currentResponse = "";
+    currentSpeechRange = null;
   }
 
   if (normalized === "SLEEPING") {
@@ -54,6 +57,7 @@ export function setEdithState(nextState) {
 
 export function setEdithResponse(text) {
   currentResponse = String(text ?? "");
+  currentSpeechRange = null;
   emitUI();
 }
 
@@ -64,6 +68,20 @@ export function appendEdithResponse(chunk) {
 
 export function clearEdithResponse() {
   currentResponse = "";
+  currentSpeechRange = null;
+  emitUI();
+}
+
+export function setEdithSpeechProgress(start, end) {
+  const rangeStart = Number(start);
+  const rangeEnd = Number(end);
+  currentSpeechRange =
+    Number.isInteger(rangeStart) &&
+    Number.isInteger(rangeEnd) &&
+    rangeStart >= 0 &&
+    rangeEnd > rangeStart
+      ? { start: rangeStart, end: rangeEnd }
+      : null;
   emitUI();
 }
 
@@ -78,6 +96,7 @@ export function subscribeEdithUI(listener) {
   listener({
     state: currentState,
     response: currentResponse,
+    speechRange: currentSpeechRange,
     visible: currentState !== "SLEEPING",
   });
 
@@ -95,6 +114,7 @@ export function registerEdithBridge() {
   window.edithSetResponse = setEdithResponse;
   window.edithAppendResponse = appendEdithResponse;
   window.edithClearResponse = clearEdithResponse;
+  window.edithSetSpeechProgress = setEdithSpeechProgress;
   window.edithSetAudioLevel = setEdithAudioLevel;
 
   return () => {
@@ -102,6 +122,7 @@ export function registerEdithBridge() {
     delete window.edithSetResponse;
     delete window.edithAppendResponse;
     delete window.edithClearResponse;
+    delete window.edithSetSpeechProgress;
     delete window.edithSetAudioLevel;
   };
 }

@@ -74,7 +74,7 @@ edith-ui/
     ├── components/
     │   ├── EdithInterface.jsx         Top-level visual composition
     │   ├── StatusIndicator.jsx        EDITH name and state label
-    │   ├── ResponseDisplay.jsx        Fallback and response text
+    │   ├── ResponseDisplay.jsx        Full response and spoken-phrase follow
     │   ├── AudioVisualizer.jsx        Small voice input/output line
     │   └── EdithOrb.jsx               Main animated Canvas orb
     └── engine/
@@ -138,18 +138,19 @@ named mutex before initializing audio, TTS, memory, or the desktop window, so
 a second launch exits without opening another microphone stream.
 
 Closing the overlay's native window hides it and keeps the assistant and
-pywebview event loop running. Voice commands `sleep`, `stop`, `go to sleep`,
-and `exit` return to wake-word mode and hide the overlay. `hibernate` also
-releases the cached Whisper model while preserving the microphone and wake
-detector; the model is loaded lazily after the next wake. After the configured
-inactivity period, the same Whisper-only hibernation happens automatically.
+pywebview event loop running. Voice commands `sleep`, `stop`, and `go to
+sleep` return to wake-word mode and hide the overlay. `exit` gracefully
+shuts down EDITH. The tray's Exit action uses the same cleanup path.
+`hibernate` also releases the cached Whisper model while preserving the
+microphone and wake detector; the model is loaded lazily after the next
+wake. After the configured inactivity period, the same Whisper-only
+hibernation happens automatically.
 The default is 300 seconds and can be changed with
 `EDITH_HIBERNATE_AFTER_SECONDS`.
 
-Only the exact command `shutdown EDITH` performs a full shutdown. It lets the
-goodbye speech finish, closes the UI and backend services, then releases the
-single-instance guard. Closing the window is intentionally not a shutdown
-action.
+Graceful shutdown lets any goodbye speech finish, closes the UI and backend
+services, then releases the single-instance guard. Closing the window is
+intentionally not a shutdown action.
 
 ## 5. Frontend startup
 
@@ -167,11 +168,15 @@ action.
 {
   state: "SLEEPING",
   response: "",
+  speechRange: null,
   visible: false
 }
 ```
 
-It registers the bridge functions, subscribes to snapshots from `edithBridge.js`, and passes those values to `EdithInterface`.
+`speechRange` is either `null` or `{ start, end }`, the character offsets
+of the response chunk currently being played. The app registers the bridge
+functions, subscribes to snapshots from `edithBridge.js`, and passes those
+values to `EdithInterface`.
 
 When opened with `?preview`, `App` cycles through READY, LISTENING, THINKING, and SPEAKING, changes state about every 5.5 seconds, and simulates an audio level. This mode is for visual inspection only; its timing is independent of real conversation timing.
 
@@ -220,19 +225,28 @@ The React page also fades its presence container on state visibility changes. Th
 | `window.edithSetResponse(text)` | `EdithDesktopWindow.set_response` | Replace displayed response text |
 | `window.edithAppendResponse(chunk)` | `EdithDesktopWindow.append_response` | Append a streamed response chunk |
 | `window.edithClearResponse()` | `EdithDesktopWindow.clear_response` | Clear the response explicitly |
+| `window.edithSetSpeechProgress(start, end)` | `EdithDesktopWindow.set_speech_progress` | Identify the response range whose audio is starting |
 | `window.edithSetAudioLevel(level)` | `EdithDesktopWindow.set_audio_level` | Set a normalized visual audio level |
 
-Python serializes text and state arguments with `json.dumps` before constructing JavaScript calls. The desktop wrapper validates states, bounds audio level to 0.0–1.0, waits for bridge readiness, and logs JavaScript communication errors.
+Python serializes text and state arguments with `json.dumps` before
+constructing JavaScript calls. Speech offsets are passed as integers; the
+bridge accepts only non-negative integer ranges with `end > start`. The
+desktop wrapper validates states, bounds audio level to 0.0–1.0, waits for
+bridge readiness, and logs JavaScript communication errors.
 
 ### 7.1 State store and React updates
 
-The bridge owns a small mutable `edithLiveStore` used by Canvas animation loops. It contains:
+The bridge owns a small mutable `edithLiveStore` used by Canvas animation
+loops. It contains:
 
 - `state`
 - `audioLevel`
 - `wakePulseAt`
 
-Separately, the bridge maintains a React-friendly current state, response, and listener set. `subscribeEdithUI` immediately sends the latest snapshot to a new subscriber, then returns an unsubscribe function. `App` uses this snapshot to render the components.
+Separately, the bridge maintains a React-friendly current state,
+response, spoken range, and listener set. `subscribeEdithUI` immediately
+sends the latest snapshot to a new subscriber, then returns an unsubscribe
+function. `App` uses this snapshot to render the components.
 
 The Canvas components read the mutable live store directly so audio/state animation does not require a React re-render on every animation frame.
 
@@ -241,11 +255,18 @@ The Canvas components read the mutable live store directly so audio/state animat
 - `setEdithResponse` replaces the current response.
 - `appendEdithResponse` adds a streamed chunk to the current response.
 - `clearEdithResponse` clears it immediately.
+- `setEdithSpeechProgress` updates the range being played without removing or replacing response text.
 - There is no timed response fade/clear.
-- A transition into LISTENING clears the displayed response. Repeating LISTENING while already in LISTENING does not clear it again.
+- Replacing or clearing the response also clears its spoken range.
+- A transition into LISTENING clears the displayed response and range. Repeating LISTENING while already in LISTENING does not clear them again.
 - The Python response loop also explicitly clears the previous response before generating a new answer.
 
-`ResponseDisplay` scrolls to the newest streamed text and uses a polite live region for screen readers.
+`ResponseDisplay` keeps the complete streamed response in the transcript,
+highlights the active spoken phrase, and smoothly follows its range.
+Before playback progress is available it follows newly generated text.
+Manual scrolling away from the bottom pauses automatic following;
+returning near the bottom re-enables it. The response remains in a polite
+live region for screen readers.
 
 ### 7.3 Audio level
 
@@ -296,9 +317,16 @@ Maps the current state to a readable uppercase label and renders the EDITH mark 
 
 ### 9.3 `ResponseDisplay`
 
-Displays streamed response text when present. Otherwise it can show fallback copy for READY, LISTENING, or THINKING. It scrolls to the latest response text as chunks arrive.
+Displays the entire response when present. Otherwise it can show fallback
+copy for READY, LISTENING, or THINKING. During speech, the active phrase
+(one TTS text chunk) is highlighted and followed by a smooth scroll. The
+full text remains available to read and select; manual scrolling is
+respected.
 
-The current transcript area is 128 pixels high, scrollable, and uses 15-pixel, medium-weight, high-contrast text. Its bottom is not faded by a mask. Longer responses can be read by scrolling inside the transcript area.
+The current transcript area is 128 pixels high, scrollable, and uses
+14-pixel, regular-weight, high-contrast text with 1.5 line spacing. Its
+bottom is not faded by a mask. Longer responses can be read by scrolling
+inside the transcript area.
 
 ### 9.4 `AudioVisualizer`
 
@@ -350,7 +378,7 @@ The orb caps frame delta to reduce large jumps after pauses. The Canvas backing 
 - `html`, `body`, and `#root` fill the viewport and remain transparent.
 - The presence container fades and scales between visible and sleeping states.
 - The left text column is constrained to avoid covering the orb.
-- The transcript has a fixed scroll region and hidden scrollbar.
+- The transcript has a fixed scroll region and a thin custom scrollbar.
 - State-specific accents update the identity mark and orb presentation.
 - The stylesheet includes a `prefers-reduced-motion` rule for CSS animation and transition durations.
 
@@ -371,6 +399,11 @@ Current performance choices include:
 
 Accessibility support includes a polite live region for response text and a descriptive `aria-label` on the orb Canvas. The UI is primarily a visual desktop overlay and does not provide a complete keyboard-driven control surface.
 
+Speech-follow is phrase-level: Piper reports the start of each queued text
+chunk, not word or phoneme timestamps. Browser simulation verifies the
+bridge and scrolling behavior, but does not measure synchronization with
+real speaker output.
+
 ## 13. Development and verification workflow
 
 1. Make source changes under `edith-ui/src/` or the UI host under `app/ui/`.
@@ -384,9 +417,17 @@ Accessibility support includes a polite live region for response text and a desc
    ```
 
 5. Confirm `edith-ui/dist/index.html` exists, then launch `Start_EDITH.bat`.
-6. Verify wake display, response streaming, sleep/hide, close-to-hide, and explicit `shutdown EDITH`.
+6. Verify wake display, response streaming and spoken-phrase following,
+   manual transcript scrolling, sleep/hide, close-to-hide, and the `exit`
+   voice command.
 
 `npm run build` checks the Vite/React/CSS production compilation. It does not test microphone capture, WebView2 transparency, Python-to-JavaScript timing, real TTS amplitude, or multi-monitor placement.
+
+For response-follow changes, also verify that `edith-ui/dist/` is rebuilt,
+the Python bridge registers `window.edithSetSpeechProgress`, and a live
+Piper chunk moves the highlight while preserving the full response. The
+browser preview can test highlighting and manual-scroll behavior with a
+simulated range; it cannot prove real audio synchronization.
 
 ## 14. Safe extension checklist
 
@@ -442,6 +483,14 @@ Check that the page loaded from the expected production build, all required `win
 ### Response text clears unexpectedly
 
 Check for an explicit `clear_response()` call in Python and for a transition into LISTENING in `edithBridge.js`. The bridge no longer applies a time-based clear.
+
+### Spoken-phrase highlight does not move
+
+Confirm that the UI is using the rebuilt `edith-ui/dist/` assets, that
+`window.edithSetSpeechProgress` is registered, and that Piper has started
+the next queued text chunk. The UI follows chunk starts, not word timings.
+Automatic following is paused while the reader is scrolled away from the
+bottom.
 
 ### Audio reactivity is present in preview but not in the live application
 
