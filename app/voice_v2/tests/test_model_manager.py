@@ -10,6 +10,17 @@ def test_lazy_cache():
     a,_=m.get_model(); b,_=m.get_model()
     assert a is b and len(calls)==1
     m.close()
+
+def test_model_reloads_after_cache_is_released():
+    calls=[]
+    def factory(size,**kwargs): calls.append(kwargs); return object()
+    m=WhisperModelManager(STTConfig(),Selector(ModelDecision("small","cpu","int8","test")),factory)
+    first,_=m.get_model()
+    m.close()
+    second,_=m.get_model()
+    assert second is not first and len(calls)==2
+    m.close()
+
 def test_gpu_load_fallback():
     calls=[]
     def factory(size,**kwargs):
