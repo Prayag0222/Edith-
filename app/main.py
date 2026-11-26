@@ -5,6 +5,7 @@ import logging
 
 import webview
 
+from app.core.commands import is_exit_command, is_sleep_command
 from app.llm.client import OllamaClient
 from app.conversation.service import ConversationService
 from app.core.assistant import EdithAssistant
@@ -29,24 +30,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
-
-
-# --------------------------------------------------
-# COMMAND DETECTION
-# --------------------------------------------------
-
-def is_exit_command(text: str) -> bool:
-    """
-    Normalize recognized text and detect the exact exit command.
-    """
-
-    normalized = re.sub(
-        r"[^\w\s]",
-        "",
-        text.casefold(),
-    ).strip()
-
-    return normalized == "exit"
 
 
 # --------------------------------------------------
@@ -197,6 +180,21 @@ def run_assistant(
                 continue
 
             print(f"You: {user_input}")
+
+            # ------------------------------------------
+            # SLEEP COMMAND
+            # ------------------------------------------
+
+            if is_sleep_command(user_input):
+
+                print(
+                    "[SLEEP] EDITH is waiting for the wake word."
+                )
+
+                voice.return_to_wake_word_mode()
+                ui.sleep()
+
+                break
 
             # ------------------------------------------
             # EXIT COMMAND
@@ -428,6 +426,7 @@ def main():
 
     print("Continuous Conversation Mode enabled.")
     print("Say 'Hey EDITH' to start.")
+    print("Say 'sleep' to wait for the wake word.")
     print("Say 'exit' to stop.\n")
 
     # ----------------------------------------------

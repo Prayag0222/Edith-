@@ -14,7 +14,12 @@ class Settings:
     )
     OLLAMA_MODEL = os.getenv(
         "OLLAMA_MODEL",
-        "llama3.2:3b",
+        "edith:latest",
+    )
+    OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "45s")
+
+    OLLAMA_THINK = os.getenv(
+        "OLLAMA_THINK","FALSE"
     )
 
 

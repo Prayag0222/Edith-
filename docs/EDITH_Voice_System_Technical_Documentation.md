@@ -594,6 +594,7 @@ venv and DLL resolution.
 -   `wait_for_wake_word()`
 -   `listen()`
 -   `prepare_for_next_turn()`
+-   `return_to_wake_word_mode()`
 -   `get_stats()`
 -   `close()`
 
@@ -624,6 +625,11 @@ and sets `_conversation_active = True`.
 
 Further calls are permitted while `_conversation_active` remains true.
 This is the mechanism that allows multiple turns after one wake phrase.
+
+The exact spoken command `sleep` returns EDITH to wake-word mode without
+sending the command to the LLM. `return_to_wake_word_mode()` clears queued
+audio and resets the wake and endpoint detectors before the next
+`wait_for_wake_word()` call. EDITH then waits for `Hey EDITH`.
 
 ## 11.4 Seven-second idle timeout
 
@@ -1094,6 +1100,7 @@ EDITH is ready — Local AI: Online
 
 Continuous Conversation Mode enabled.
 Say 'Hey EDITH' to start.
+Say 'sleep' to wait for the wake word.
 Say 'exit' to stop.
 
 [READY] Waiting for wake word...
@@ -1108,8 +1115,10 @@ Smoke test:
 5.  Stay silent for more than seven seconds.
 6.  Confirm return to wake-word mode.
 7.  Say "Hey EDITH" again.
-8.  Say "Exit."
-9.  Confirm clean shutdown.
+8.  Say "sleep" during a conversation and confirm wake-word mode resumes.
+9.  Say "Hey EDITH" again.
+10. Say "Exit."
+11. Confirm clean shutdown.
 
 Test suite:
 

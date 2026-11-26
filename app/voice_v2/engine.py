@@ -382,6 +382,28 @@ class VoiceEngine:
         )
 
         print("[LISTEN] Microphone ready for next user turn.")
+
+    def return_to_wake_word_mode(self) -> None:
+        """End the active conversation and clear audio before wake detection."""
+
+        if not self._conversation_active:
+            return
+
+        subscription = self._subscription
+        wake_adapter = self._wake_adapter
+
+        if subscription is None or wake_adapter is None:
+            raise RuntimeError("VoiceEngine initialization incomplete")
+
+        subscription.discard_pending()
+
+        if self._endpoint is not None:
+            self._endpoint.reset()
+
+        wake_adapter.reset()
+        self._wake_detected = False
+        self._conversation_active = False
+
     # --------------------------------------------------
     # STATUS
     # --------------------------------------------------

@@ -6,8 +6,6 @@ const VALID_STATES = new Set([
   "SPEAKING",
 ]);
 
-const DEFAULT_FADE_MS = 12000;
-
 /**
  * Shared mutable store for 60fps Canvas reads (zero React re-renders).
  */
@@ -18,7 +16,6 @@ export const edithLiveStore = {
 };
 
 let uiListeners = new Set();
-let fadeTimer = null;
 let currentState = "SLEEPING";
 let currentResponse = "";
 
@@ -31,19 +28,12 @@ function emitUI() {
   uiListeners.forEach((listener) => listener(snapshot));
 }
 
-function scheduleFadeClear() {
-  clearTimeout(fadeTimer);
-  fadeTimer = setTimeout(() => {
-    currentResponse = "";
-    emitUI();
-  }, DEFAULT_FADE_MS);
-}
-
 export function setEdithState(nextState) {
   const normalized = String(nextState || "SLEEPING").toUpperCase();
   if (!VALID_STATES.has(normalized)) return;
 
-  const wasSleeping = currentState === "SLEEPING";
+  const previousState = currentState;
+  const wasSleeping = previousState === "SLEEPING";
   currentState = normalized;
   edithLiveStore.state = normalized;
 
@@ -51,8 +41,7 @@ export function setEdithState(nextState) {
     edithLiveStore.wakePulseAt = performance.now();
   }
 
-  if (normalized === "THINKING" || normalized === "SLEEPING") {
-    clearTimeout(fadeTimer);
+  if (normalized === "LISTENING" && previousState !== "LISTENING") {
     currentResponse = "";
   }
 
@@ -65,18 +54,15 @@ export function setEdithState(nextState) {
 
 export function setEdithResponse(text) {
   currentResponse = String(text ?? "");
-  scheduleFadeClear();
   emitUI();
 }
 
 export function appendEdithResponse(chunk) {
   currentResponse += String(chunk ?? "");
-  scheduleFadeClear();
   emitUI();
 }
 
 export function clearEdithResponse() {
-  clearTimeout(fadeTimer);
   currentResponse = "";
   emitUI();
 }
@@ -112,7 +98,6 @@ export function registerEdithBridge() {
   window.edithSetAudioLevel = setEdithAudioLevel;
 
   return () => {
-    clearTimeout(fadeTimer);
     delete window.edithSetState;
     delete window.edithSetResponse;
     delete window.edithAppendResponse;

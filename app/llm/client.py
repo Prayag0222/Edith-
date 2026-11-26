@@ -12,6 +12,7 @@ class OllamaClient:
     def __init__(self, edith, model: str | None = None):
         self.edith = edith
         self.model = model or settings.OLLAMA_MODEL
+        self.keep_alive = settings.OLLAMA_KEEP_ALIVE
         self.base_url = settings.OLLAMA_BASE_URL
         self.request_lock = threading.RLock()
 
@@ -44,13 +45,13 @@ Use it when relevant to the user's question.
 
 MEMORY RULES:
 
-* Memory is supporting context, not the answer itself.
-* Identify what the user is actually asking before retrieving information.
-* Use relevant memories to answer the question directly.
-* Do not repeat identity information unless the user asks about identity.
-* When asked about previous conversations, summarize relevant historical records.
-* Distinguish known information from missing information.
-* Never invent events, decisions, or personal details.
+- Memory is supporting context, not the answer itself.
+- Identify what the user is actually asking before retrieving information.
+- Use relevant memories to answer the question directly.
+- Do not repeat identity information unless the user asks about identity.
+- When asked about previous conversations, summarize relevant historical records.
+- Distinguish known information from missing information.
+- Never invent events, decisions, or personal details.
 """
         else:
             memory_section = """
@@ -77,19 +78,26 @@ SELF-DESCRIPTION
 
 COMMUNICATION RULES
 
-* Speak directly to Prayag.
-* Refer to yourself as "I", "me", or "my".
-* Refer to Prayag as "you" or "your".
-* Never confuse your identity with Prayag's identity.
-* Do not claim an action was completed unless it was actually executed.
-* Respond naturally, clearly, and directly.
+- Speak directly to Prayag.
+- Refer to yourself as "I", "me", or "my".
+- Refer to Prayag as "you" or "your".
+- Never confuse your identity with Prayag's identity.
+- Do not claim an action was completed unless it was actually executed.
+- Respond naturally, clearly, and directly in 2 to 3 concise sentences unless asked for detail.
+- NEVER use emojis, emoticons, asterisks, bullet points, or markdown symbols because your responses are spoken aloud by a voice synthesizer.
 """
+
+        formatted_messages = [dict(msg) for msg in messages]
+        if formatted_messages and formatted_messages[-1].get("role") == "user":
+            content = formatted_messages[-1].get("content", "")
+
+
         return [
             {
                 "role": "system",
                 "content": system_message,
             },
-            *messages,
+            *formatted_messages,
         ]
 
     def generate_stream(
@@ -125,6 +133,10 @@ COMMUNICATION RULES
             "model": self.model,
             "messages": chat_messages,
             "stream": True,
+            "keep_alive": self.keep_alive,
+            "options": {
+                "num_ctx": 2048,
+            },
         }
 
         request = urllib.request.Request(
