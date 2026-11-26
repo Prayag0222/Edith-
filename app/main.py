@@ -1,6 +1,9 @@
 import re
 import queue
 import threading
+import logging
+
+import webview
 
 from app.llm.client import OllamaClient
 from app.conversation.service import ConversationService
@@ -12,6 +15,21 @@ from app.memory.workers.worker_manager import BackgroundMemoryWorker
 from app.voice.tts import TextToSpeech
 from app.voice_v2.engine import VoiceEngine
 
+from app.ui.desktop_window import EdithDesktopWindow
+from app.ui.state_manager import EdithUIController
+
+
+# --------------------------------------------------
+# LOGGING
+# --------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
 
 # --------------------------------------------------
 # COMMAND DETECTION
@@ -19,12 +37,7 @@ from app.voice_v2.engine import VoiceEngine
 
 def is_exit_command(text: str) -> bool:
     """
-    Normalize the recognized text and detect the exact exit command.
-
-    Examples:
-        Exit.
-        EXIT!
-        exit
+    Normalize recognized text and detect the exact exit command.
     """
 
     normalized = re.sub(
@@ -43,9 +56,6 @@ def is_exit_command(text: str) -> bool:
 def extract_speech_chunks(buffer: str, final: bool = False):
     """
     Split streamed LLM output into manageable TTS chunks.
-
-    This allows Piper to start speaking before the complete
-    LLM response has been generated.
     """
 
     chunks = []
@@ -74,8 +84,8 @@ def extract_speech_chunks(buffer: str, final: bool = False):
 
             continue
 
-        # If punctuation hasn't arrived, split long text at a
-        # nearby word boundary to prevent excessive TTS delay.
+        # Split long text at a word boundary to avoid
+        # excessive delay before Piper receives text.
         if len(buffer) >= 180:
 
             split_at = buffer.rfind(" ", 0, 180)
@@ -100,18 +110,21 @@ def extract_speech_chunks(buffer: str, final: bool = False):
 # --------------------------------------------------
 
 def speech_worker(tts, speech_queue):
+
     """
     Run Piper in a separate thread.
 
-    This allows LLM generation and speech playback to work
-    concurrently instead of waiting for the full response.
+    This keeps speech synthesis and playback independent
+    of the main LLM generation loop.
     """
 
     try:
+
         tts.speak_stream(speech_queue)
 
-    except Exception as error:
-        print(f"\n[TTS ERROR] {error}")
+    except Exception:
+
+        logger.exception("TTS worker failed")
 
 
 # --------------------------------------------------
@@ -125,13 +138,14 @@ def run_assistant(
     voice,
     tts,
     memory_manager,
+    ui,
 ):
 
     while True:
 
-        # --------------------------------------------------
+        # ----------------------------------------------
         # SLEEP / WAKE MODE
-        # --------------------------------------------------
+        # ----------------------------------------------
 
         print("\n[READY] Waiting for wake word...")
 
@@ -140,18 +154,21 @@ def run_assistant(
 
         print("[WAKE] Wake word detected.")
 
-        # --------------------------------------------------
+        # Show the popup and enter listening state.
+        ui.activate("LISTENING")
+
+        # ----------------------------------------------
         # CONTINUOUS CONVERSATION MODE
-        # --------------------------------------------------
+        # ----------------------------------------------
 
         while True:
 
-            # This call accepts the first turn after wake detection
-            # and every subsequent turn during the active conversation.
             result = voice.listen()
 
-            # None means the user remained silent for 7 seconds.
-            # The voice engine has already ended the conversation.
+            # ------------------------------------------
+            # IDLE TIMEOUT
+            # ------------------------------------------
+
             if result is None:
 
                 print(
@@ -159,40 +176,58 @@ def run_assistant(
                     "Waiting for wake word.\n"
                 )
 
+                # Hide the popup without stopping EDITH.
+                ui.sleep()
+
                 break
 
             user_input = result.get("text", "").strip()
 
             if not user_input:
 
-                print("[LISTEN] No usable transcription. Listening again.")
+                print(
+                    "[LISTEN] No usable transcription. "
+                    "Listening again."
+                )
 
                 voice.prepare_for_next_turn()
+
+                ui.set_state("LISTENING")
 
                 continue
 
             print(f"You: {user_input}")
 
-            # Exit is handled before calling the LLM.
+            # ------------------------------------------
+            # EXIT COMMAND
+            # ------------------------------------------
+
             if is_exit_command(user_input):
 
                 print("EDITH: Goodbye.")
 
-                tts.speak("Goodbye.")
+                ui.activate("SPEAKING")
 
-                return
+                try:
+                    tts.speak("Goodbye.")
 
-            # --------------------------------------------------
-            # THINKING / RESPONSE GENERATION
-            # --------------------------------------------------
+                finally:
+                    return
+
+            # ------------------------------------------
+            # THINKING
+            # ------------------------------------------
 
             print("[THINK] Thinking...")
+
+            ui.set_state("THINKING")
 
             speech_queue = queue.Queue()
 
             worker = threading.Thread(
                 target=speech_worker,
                 args=(tts, speech_queue),
+                name="EDITH-TTS-Worker",
                 daemon=True,
             )
 
@@ -200,11 +235,15 @@ def run_assistant(
 
             print("EDITH: ", end="", flush=True)
 
+            ui.desktop.clear_response()
+
             speech_buffer = ""
+
+            speaking_started = False
 
             try:
 
-                # Generate the response incrementally.
+                # Generate LLM response incrementally.
                 for chunk in edith.respond_stream(
                     conversation,
                     llm,
@@ -214,6 +253,8 @@ def run_assistant(
 
                     print(chunk, end="", flush=True)
 
+                    ui.desktop.append_response(chunk)
+
                     speech_buffer += chunk
 
                     ready_chunks, speech_buffer = extract_speech_chunks(
@@ -221,38 +262,113 @@ def run_assistant(
                     )
 
                     for speech_chunk in ready_chunks:
+
+                        # Change to SPEAKING when the first
+                        # speech chunk is ready for Piper.
+                        if not speaking_started:
+
+                            ui.set_state("SPEAKING")
+                            speaking_started = True
+
                         speech_queue.put(speech_chunk)
 
-                # Send any remaining text to Piper.
+                # Send remaining response text to Piper.
                 remaining_chunks, _ = extract_speech_chunks(
                     speech_buffer,
                     final=True,
                 )
 
                 for speech_chunk in remaining_chunks:
+
+                    if not speaking_started:
+
+                        ui.set_state("SPEAKING")
+                        speaking_started = True
+
                     speech_queue.put(speech_chunk)
 
                 print("\n")
 
             finally:
 
-                # None tells the TTS worker that no more text
-                # will be added to this response.
+                # Tell Piper that response generation is complete.
                 speech_queue.put(None)
 
-                # Wait until all queued speech has been processed.
+                # Wait until queued speech is processed.
                 speech_queue.join()
 
                 worker.join()
 
-            # --------------------------------------------------
-            # PREPARE FOR NEXT USER TURN
-            # --------------------------------------------------
+            # ------------------------------------------
+            # PREPARE NEXT TURN
+            # ------------------------------------------
 
-            # Discard microphone audio captured during Piper playback.
-            # The conversation stays active, so another wake word
-            # is NOT required for the next question.
             voice.prepare_for_next_turn()
+
+            # EDITH is ready for another user utterance.
+            ui.set_state("LISTENING")
+
+
+# --------------------------------------------------
+# APPLICATION RUNTIME
+# --------------------------------------------------
+
+def assistant_runtime(
+    edith,
+    llm,
+    conversation,
+    voice,
+    tts,
+    memory_manager,
+    memory_worker,
+    ui,
+):
+
+    """
+    Runs EDITH's backend independently of the GUI event loop.
+
+    pywebview owns the main thread.
+    The assistant runs in a background thread.
+    """
+
+    try:
+
+        run_assistant(
+            edith,
+            llm,
+            conversation,
+            voice,
+            tts,
+            memory_manager,
+            ui,
+        )
+
+    except Exception:
+
+        logger.exception("EDITH encountered an unexpected error")
+
+    finally:
+
+        print("\n[SHUTDOWN] Closing EDITH...")
+
+        try:
+            voice.close()
+
+        finally:
+
+            try:
+                tts.close()
+
+            finally:
+
+                try:
+                    memory_worker.close()
+
+                finally:
+
+                    ui.close()
+
+        print("[SHUTDOWN] EDITH closed.")
 
 
 # --------------------------------------------------
@@ -261,14 +377,16 @@ def run_assistant(
 
 def main():
 
+    # ----------------------------------------------
+    # INITIALIZE EXISTING EDITH COMPONENTS
+    # ----------------------------------------------
+
     edith = EdithAssistant()
 
     llm = OllamaClient(edith)
 
-    # One shared microphone stream handles wake detection and speech.
     voice = VoiceEngine()
 
-    # Existing Piper TTS implementation remains unchanged.
     tts = TextToSpeech()
 
     memory = MemoryService()
@@ -286,6 +404,20 @@ def main():
         memory_worker,
     )
 
+    # ----------------------------------------------
+    # INITIALIZE DESKTOP UI
+    # ----------------------------------------------
+
+    desktop = EdithDesktopWindow()
+
+    desktop.create()
+
+    ui = EdithUIController(desktop)
+
+    # ----------------------------------------------
+    # STARTUP STATUS
+    # ----------------------------------------------
+
     if llm.is_available():
 
         print("EDITH is ready — Local AI: Online\n")
@@ -298,34 +430,43 @@ def main():
     print("Say 'Hey EDITH' to start.")
     print("Say 'exit' to stop.\n")
 
-    try:
+    # ----------------------------------------------
+    # START ASSISTANT THREAD
+    # ----------------------------------------------
 
-        run_assistant(
+    assistant_thread = threading.Thread(
+        target=assistant_runtime,
+        args=(
             edith,
             llm,
             conversation,
             voice,
             tts,
             memory_manager,
-        )
+            memory_worker,
+            ui,
+        ),
+        name="EDITH-Assistant",
+        daemon=True,
+    )
 
-    finally:
+    assistant_thread.start()
 
-        print("\n[SHUTDOWN] Closing EDITH...")
+    # ----------------------------------------------
+    # START DESKTOP EVENT LOOP
+    # ----------------------------------------------
 
-        try:
-            voice.close()
+    # pywebview manages the main GUI thread.
+    # The assistant runs independently in assistant_thread.
+    webview.start()
 
-        finally:
+    # Wait for the assistant thread to finish after GUI exits.
+    assistant_thread.join()
 
-            try:
-                tts.close()
 
-            finally:
-                memory_worker.close()
-
-        print("[SHUTDOWN] EDITH closed.")
-
+# --------------------------------------------------
+# ENTRY POINT
+# --------------------------------------------------
 
 if __name__ == "__main__":
     main()

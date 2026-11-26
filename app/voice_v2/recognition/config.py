@@ -12,7 +12,7 @@ class STTConfig:
     condition_on_previous_text: bool = False
     local_files_only: bool = True
     download_root: str | None = None
-    gpu_min_free_vram_mb: float = 1800.0
+    gpu_min_free_vram_mb: float = 1200.0
     gpu_max_utilization: float = 75.0
     inference_lock: bool = True
     def __post_init__(self):
