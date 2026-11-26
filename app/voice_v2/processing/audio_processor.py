@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
 
+from app.voice_v2.processing.denoiser import DENOISE_ENABLED, denoise_audio
+
 
 @dataclass(frozen=True, slots=True)
 class AudioMetrics:
@@ -30,6 +32,12 @@ class AudioProcessor:
         if not np.all(np.isfinite(samples)):
             raise ValueError("Audio contains NaN or infinite values")
         return samples
+
+    def process(self, audio: np.ndarray, sample_rate: int = 16000) -> np.ndarray:
+        samples = self.normalize_input(audio)
+        if not DENOISE_ENABLED:
+            return samples
+        return denoise_audio(samples, sample_rate)
 
     def analyze(self, audio: np.ndarray) -> AudioMetrics:
         samples = self.normalize_input(audio)

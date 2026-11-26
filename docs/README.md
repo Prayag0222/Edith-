@@ -11,7 +11,7 @@ a document and the checked-out code differ.
   lifecycle, components, Canvas rendering, and troubleshooting.
 - [EDITH Voice System — Technical Architecture & Developer Documentation](./EDITH_Voice_System_Technical_Documentation.md)  
   Microphone capture, wake-word flow, STT, conversation lifecycle, TTS
-  coordination, and voice troubleshooting.
+  coordination, CPU denoising, wake-word noise gating, and troubleshooting.
 - [EDITH Memory System — Technical Architecture, Data Flow & Debugging Guide](./EDITH_Memory_System_Technical_Documentation.md)  
   Conversation and structured memory, retrieval, persistence, and
   debugging guidance.

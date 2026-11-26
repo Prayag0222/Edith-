@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 import threading
@@ -7,6 +8,10 @@ from .base import STTBackend
 from .config import STTConfig
 from .model_manager import WhisperModelManager
 from .transcription_result import TranscriptionResult, TranscriptionSegment
+from app.voice_v2.processing.audio_processor import AudioProcessor
+
+
+logger = logging.getLogger(__name__)
 
 
 def setup_cuda_dll_paths():
@@ -54,6 +59,7 @@ class SpeechToTextEngine(STTBackend):
         self.config = config or STTConfig()
         self.model_manager = model_manager or WhisperModelManager(self.config)
         self.task_classifier = task_classifier
+        self.audio_processor = AudioProcessor()
         self._lock = threading.Lock()
 
     def _prepare_audio(self, audio):
@@ -84,10 +90,19 @@ class SpeechToTextEngine(STTBackend):
         segments, info = model.transcribe(
             source, beam_size=beam, language=language, task=self.config.task,
             vad_filter=self.config.vad_filter,
-            condition_on_previous_text=self.config.condition_on_previous_text)
+            condition_on_previous_text=self.config.condition_on_previous_text,
+            temperature=self.config.temperature,
+            initial_prompt=self.config.initial_prompt,
+            no_speech_threshold=self.config.no_speech_threshold)
         texts, out = [], []
         # Faster-Whisper returns a lazy generator; consume it exactly once.
         for s in segments:
+            no_speech_prob = getattr(s, "no_speech_prob", None)
+            if (
+                no_speech_prob is not None
+                and no_speech_prob >= self.config.no_speech_threshold
+            ):
+                continue
             text = (s.text or "").strip()
             if text:
                 texts.append(text)
@@ -99,44 +114,51 @@ class SpeechToTextEngine(STTBackend):
                 float(duration) if duration is not None else None, tuple(out))
 
     def transcribe(self, audio, *, language=None, beam_size=None):
+        denoise_ms = 0.0
         if isinstance(audio, (str, os.PathLike)):
             path = Path(audio)
             if not path.is_file(): raise FileNotFoundError(f"Audio file not found: {path}")
             source, input_duration = str(path), None
         else:
             source = self._prepare_audio(audio)
+            denoise_started = time.perf_counter()
+            source = self.audio_processor.process(
+                source,
+                sample_rate=self.config.sample_rate,
+            )
+            source = self._prepare_audio(source)
+            denoise_ms = (time.perf_counter() - denoise_started) * 1000
             input_duration = source.size / self.config.sample_rate
+            if self.audio_processor.analyze(source).is_silent:
+                logger.info(
+                    "STT skipped silent audio | denoise_ms=%.2f stt_ms=0.00",
+                    denoise_ms,
+                )
+                return None
         beam = self.config.beam_size if beam_size is None else beam_size
         if beam < 1: raise ValueError("beam_size must be >= 1")
 
         lock = self._lock if self.config.inference_lock else _NullLock()
         with lock:
-            model, decision = self.model_manager.get_model()
+            started = time.perf_counter()
+            model, decision = self.model_manager.get_cpu_model()
             print(f"[STT DEBUG] Selected device: {decision.device}")
             print(f"[STT DEBUG] Selected model: {decision.model_size}")
             print(f"[STT DEBUG] Selection reason: {decision.reason}")
             status = getattr(self.model_manager, "status", None)
             if callable(status):
                 print(f"[STT DEBUG] Model manager status: {status()}")
-            started = time.perf_counter()
             try:
                 values = self._run(model, source, language or self.config.language, beam)
             except Exception as exc:
-                print(f"[STT ERROR] CUDA inference failed: {type(exc).__name__}: {exc}")
-
-                if decision.device != "cuda":
-                    raise
-
-                print("[STT] Falling back to CPU...")
-                model, decision = self.model_manager.get_cpu_model()
-
-                values = self._run(
-                        model,
-                        source,
-                        language or self.config.language,
-                        beam
-                        )
-            elapsed = time.perf_counter() - started
+                logger.exception("CPU STT inference failed")
+                raise
+            stt_ms = (time.perf_counter() - started) * 1000
+            logger.info(
+                "STT timings | denoise_ms=%.2f stt_ms=%.2f",
+                denoise_ms,
+                stt_ms,
+            )
 
         text, lang, probability, duration, segments = values
         if not text: return None
@@ -145,7 +167,7 @@ class SpeechToTextEngine(STTBackend):
             text=text, language=lang, language_probability=probability,
             model_size=decision.model_size, device=decision.device,
             compute_type=decision.compute_type, selection_reason=decision.reason,
-            processing_seconds=elapsed,
+            processing_seconds=stt_ms / 1000,
             audio_duration_seconds=duration if duration is not None else input_duration,
             task_type=task_type, classification_confidence=confidence,
             classification_reason=reason, segments=segments)

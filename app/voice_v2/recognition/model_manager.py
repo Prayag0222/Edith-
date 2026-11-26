@@ -76,7 +76,8 @@ class WhisperModelManager:
             from faster_whisper import WhisperModel
             factory = WhisperModel
         kwargs = {"device": decision.device, "compute_type": decision.compute_type,
-                  "local_files_only": self.config.local_files_only}
+                  "local_files_only": self.config.local_files_only,
+                  "cpu_threads": self.config.cpu_threads}
         if self.config.download_root:
             kwargs["download_root"] = self.config.download_root
         return factory(decision.model_size, **kwargs)

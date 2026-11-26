@@ -81,6 +81,9 @@ verification. They are **environment observations**, not a lockfile or a
 promise that every machine has the same versions. The root
 [requirements.txt](../requirements.txt) only declares the added tray packages;
 it is not a complete install manifest for the entire application.
+The checked `.venv` also has sherpa-onnx 2.0.3 installed for GTCRN; that
+package is not declared in the root requirements file, so a fresh
+environment must install it separately to enable denoising.
 
 | Technology | What it is and EDITH's use | Communication boundary |
 |---|---|---|
@@ -91,7 +94,8 @@ it is not a complete install manifest for the entire application.
 | NumPy 2.5.3 | Represents, converts, buffers, and validates audio samples. | Arrays are passed from audio capture through the wake/VAD/STT code. |
 | openWakeWord feature utilities and ONNX Runtime 1.30.0 | EDITH's frozen wake-word assets are ONNX models. `WakeWordDetector` uses ONNX Runtime and openWakeWord's `AudioFeatures`. | `WakeWordAdapter` converts shared float32 chunks to int16 and feeds the existing detector. The detector's ONNX session uses the CPU execution provider. |
 | Silero VAD 6.2.3 and PyTorch 2.14.0 | VAD estimates whether incoming frames contain speech. | The endpoint detector sends 512-sample frames at 16 kHz to the Silero wrapper; the wrapper converts each frame to a torch tensor. |
-| Faster-Whisper 1.2.1 / CTranslate2 | Converts completed speech segments into text. The model manager chooses a device and holds a lazy cache. | `VoiceEngine.listen()` passes a completed NumPy waveform to `SpeechToTextEngine`; the result returns to the assistant loop. Current `STTConfig` defaults are model `small`, device `auto`, CPU `int8`, and a 1,200 MB free-VRAM threshold; GPU failures can fall back to CPU. |
+| sherpa-onnx 2.0.3 / GTCRN | Optionally denoises completed 16 kHz utterances. | `AudioProcessor` uses the lazily loaded GTCRN model on CPU; unavailable or failing model setup falls back to raw audio. |
+| Faster-Whisper 1.2.1 / CTranslate2 | Converts completed speech segments into text. | `VoiceEngine.listen()` passes a completed waveform through GTCRN and then `SpeechToTextEngine`; that engine explicitly requests `small`, CPU/int8, six CPU threads, and a lazy model cache. It does not use GPU selection on the active voice path. |
 | Ollama HTTP API | Runs the configured local chat model in the separate Ollama server process. | `OllamaClient` uses Python's `urllib` to call `/api/tags` and streaming `/api/chat`; no `ollama` Python package was installed in the checked environment. |
 | Piper TTS 1.8.0 | Produces EDITH's spoken English or Hindi response using the existing local voice models. | The assistant queues text; Piper produces audio chunks, which are written to the output stream. The current paths are defined in `TextToSpeech`: `D:\Edith\en_US-lessac-medium.onnx` and `D:\Edith\models\tts\hindi\hi_IN-priyamvada-medium.onnx`. |
 | SQLite (`sqlite3`) | Stores conversation messages, embeddings, and structured memories. | Memory services use short-lived SQLite connections through `app.memory.database`. |
@@ -119,10 +123,11 @@ from the Python class name.
 | `app.core.commands` | Normalizes a transcription and checks whether it is one of the exact lifecycle phrases. |
 | `app.voice_v2.engine` | Orchestrates the persistent audio subscription, wake wait, VAD/endpointing, transcription, conversation flags, post-TTS cleanup, hibernation, and close. |
 | `app.voice_v2.core.audio_input` | Owns one `sounddevice.InputStream`, its callback queue, dispatcher thread, and bounded subscriber queues. |
-| `app.voice_v2.integration.wake_word_adapter` | Adapts the shared float32 microphone chunks to the existing wake detector. |
+| `app.voice_v2.integration.wake_word_adapter` | Adapts raw shared float32 chunks to the existing wake detector and gates scored detections with the shared Silero VAD. |
 | `app.voice` wake-word module | Loads the existing wake-word ONNX assets and runs score/RMS/cooldown checks. Its standalone stream-reading method is not used by the active `VoiceEngine` path. |
 | `app.voice_v2.detection` | Silero VAD and adaptive endpointing produce completed speech segments. |
-| `app.voice_v2.recognition` | Faster-Whisper transcription, device choice, lazy model cache, and result formatting. |
+| `app.voice_v2.processing` | Audio validation/metrics and optional GTCRN denoising before STT. |
+| `app.voice_v2.recognition` | CPU/int8 Faster-Whisper transcription, lazy model cache, no-speech filtering, and result formatting. |
 | `app.llm.client` | Builds the Ollama request and streams response text. |
 | `app.core.assistant` and `app.conversation` | Build memory-informed prompts, retain the current bounded chat history, and queue persistence/extraction. |
 | `app.memory` | Loads embeddings, retrieves memories, and persists conversation/structured-memory records in SQLite. |
@@ -441,11 +446,13 @@ While the assistant thread calls `wait_for_wake_word()`:
 1. Pending audio from the prior turn is discarded.
 2. The wake adapter resets the detector's rolling buffer.
 3. The assistant thread pulls chunks from the audio subscription.
-4. The adapter converts float samples to int16 and feeds the legacy detector.
+4. The adapter feeds raw float32 samples to the shared Silero VAD, then
+   converts the same un-denoised samples to int16 for the legacy detector.
 5. The detector waits for its 2-second rolling window, checks RMS, then runs
    ONNX inference when the adapter's sample check interval has elapsed.
-6. The wake score must meet the configured threshold and respect a 2-second
-   cooldown before `wait_for_wake_word()` returns `True`.
+6. A wake score of at least `0.94` must pass two consecutive checks and
+   have recent Silero speech evidence (probability at least `0.55` within
+   one second); the detector's 2-second cooldown still applies.
 7. `lifecycle.activate()` changes the application mode; the UI controller
    shows the overlay and moves it to `LISTENING`.
 
@@ -469,8 +476,15 @@ The current endpoint source defaults are in
 0.5-second pre-roll, 0.55 start threshold, 0.35 continuation threshold,
 64 ms start confirmation, 1,000 ms short-speech end silence, and 3,500 ms
 after sufficient sustained speech. `SpeechToTextEngine.transcribe()` then
-loads/reuses Faster-Whisper through the model manager and returns a
-transcription payload.
+passes the utterance through `AudioProcessor` and the CPU GTCRN model
+before loading/reusing Faster-Whisper. Processed audio below the
+`0.002` RMS silence threshold is skipped. The active STT path requests
+CPU/int8 with six threads, beam size 2, temperature 0.0, no
+previous-text conditioning, and the prompt
+`EDITH, Prayag, Python, Ollama, VS Code.` Segments with
+`no_speech_prob >= 0.6` are discarded. `denoise_ms` and `stt_ms` are
+logged; the timings include lazy model acquisition on the first request
+to each model.
 
 ```mermaid
 sequenceDiagram
@@ -479,6 +493,7 @@ sequenceDiagram
     participant Assistant as EDITH-Assistant
     participant Wake as WakeWordAdapter + ONNX
     participant Endpoint as Silero VAD + endpoint detector
+    participant Enhance as AudioProcessor / GTCRN CPU
     participant STT as SpeechToTextEngine / Whisper
     participant UI as UI controller
 
@@ -490,7 +505,8 @@ sequenceDiagram
     Assistant->>UI: activate LISTENING
     Assistant->>Endpoint: process subsequent chunks
     Endpoint-->>Assistant: completed SpeechSegment
-    Assistant->>STT: transcribe(segment.audio)
+    Assistant->>Enhance: denoise 16 kHz utterance
+    Enhance->>STT: processed float32 audio
     STT-->>Assistant: text / metadata
 ```
 
@@ -822,8 +838,10 @@ status change does not identify which process caused it.
 | [`app/ui/desktop_window.py`](../app/ui/desktop_window.py) | Modified | `EdithDesktopWindow` creates the pywebview overlay, checks bridge readiness, hides on user close, and exposes `show()`, `hide()`, and programmatic `close()`. |
 | [`app/ui/state_manager.py`](../app/ui/state_manager.py) | Related source, not a lifecycle-status entry | `EdithUIController` synchronizes UI state, delays hide for the CSS fade, and routes desktop UI actions. |
 | [`app/voice_v2/engine.py`](../app/voice_v2/engine.py) | Modified | `VoiceEngine.hibernate()` releases only STT cache; `wait_for_wake_word()`, `listen()`, `prepare_for_next_turn()`, `return_to_wake_word_mode()`, and `close()` manage the persistent voice path. |
-| [`app/voice_v2/recognition/model_manager.py`](../app/voice_v2/recognition/model_manager.py) | Related source, not a lifecycle-status entry | `WhisperModelManager` lazily loads one model, selects device, caches it under a lock, and clears references in `close()`. |
-| [`app/voice_v2/integration/wake_word_adapter.py`](../app/voice_v2/integration/wake_word_adapter.py) | Related source, not a lifecycle-status entry | `WakeWordAdapter` forwards shared audio blocks into the existing detector; it does not open another stream. |
+| [`app/voice_v2/processing/denoiser.py`](../app/voice_v2/processing/denoiser.py) | Added in audio update | Lazily loads `gtcrn_simple.onnx` through sherpa-onnx on CPU and safely returns raw audio when unavailable. |
+| [`models/denoiser/gtcrn_simple.onnx`](../models/denoiser/gtcrn_simple.onnx) | Downloaded model asset | GTCRN 16 kHz speech-denoising model consumed by `denoiser.py`; the wake-word stream does not use it. |
+| [`app/voice_v2/recognition/model_manager.py`](../app/voice_v2/recognition/model_manager.py) | Related source, not a lifecycle-status entry | `WhisperModelManager` lazily loads and caches one model under a lock; the active `SpeechToTextEngine` requests CPU/int8. |
+| [`app/voice_v2/integration/wake_word_adapter.py`](../app/voice_v2/integration/wake_word_adapter.py) | Related source, not a lifecycle-status entry | `WakeWordAdapter` forwards raw shared audio to the existing detector and requires the configured score/debounce plus recent Silero speech evidence. |
 | [`app/voice/tts.py`](../app/voice/tts.py) | Related source, not a lifecycle-status entry | Existing `TextToSpeech` loads English/Hindi Piper voices and owns the output stream; lifecycle work calls it without replacing the models. |
 
 ### Tests, guides, and data visible in the worktree
@@ -905,14 +923,17 @@ OLLAMA_KEEP_ALIVE=45s
 | `git diff --check` | **PASS** | No whitespace errors. Git emitted line-ending conversion warnings for some existing worktree files; these were warnings, not check failures. |
 | Installed dependency consistency | **PASS** | `pip check` reported no broken requirements. |
 | Model cache lazy reload | **PASS — automated** | Fake model manager test confirms a new model object is obtained after `close()`. It does not measure physical VRAM release. |
+| November CPU-audio focused checks | **PASS** | Real GTCRN CPU inference, cached Faster-Whisper `small` CPU/int8 inference, VAD silence gating, STT fallback/filtering, and shared VAD wiring were smoke-tested. Synthetic non-speech input correctly produced no transcript; these checks do not establish live speech accuracy. |
+| VRAM point observation during CPU STT | **PASS — unchanged** | `nvidia-smi` reported 71 MiB before and after the check. This is a point observation, not a benchmark or zero-total-VRAM claim. |
 | Tray backend smoke | **PASS — previously recorded Windows smoke** | Icon registration, status/title update from another thread, repeated-start idempotence, and stop request were reported as exercised against the Windows backend. This is not a complete app/UI/menu-click test. |
 | Full end-to-end wake, speech, LLM, TTS, and shutdown in the live application | **NOT independently verified here** | Unit tests mock substantial parts of this path. |
-| RAM/VRAM benchmark | **NOT RUN** | No resource numbers are claimed. |
+| RAM/full-session VRAM benchmark | **NOT RUN** | A single before/after VRAM observation is recorded above; no benchmark or RAM measurement is claimed. |
 
-The prior broad discovery run reported unrelated failures involving a
+The prior broad discovery run reported failures involving a
 CUDA-versus-CPU expectation, `adaptive_engine` fixture state, an obsolete
 memory import, and other default-discovery Kokoro/memory-count expectations.
-Those are not lifecycle fixes and were not rerun or changed for this report.
+The CUDA expectation predates the active voice path's CPU-only requirement;
+the broader suite was not rerun for the audio update.
 
 ### Developer-reported manual testing
 
@@ -920,9 +941,13 @@ The task brief says manual Windows integration testing was completed by the
 developer. This report records that as **developer-reported**, not as a test
 this documentation pass independently witnessed. No detailed manual
 checklist, screen recording, or test log was provided in the repository.
+After the CPU-audio installation, the user also reported that EDITH was
+working during manual use; no case-by-case results were provided, so this
+remains user-reported rather than independently verified here.
 Earlier verification in this conversation explicitly recorded full
-application microphone/UI/TTS integration as not run; the standalone tray
-backend smoke is the only Windows runtime check with concrete detail here.
+application microphone/UI/TTS integration as not independently verified.
+The tray backend smoke is the only lifecycle UI/backend check with concrete
+detail; the CPU-audio smoke checks above did not use a live microphone.
 Therefore do not treat every manual acceptance item as independently
 reproduced from this report alone.
 
@@ -969,12 +994,10 @@ two voice loops against the same microphone at once.
 8. **Current model identity depends on local Ollama configuration.** The
    default tag is `edith:latest`; source does not establish that it resolves
    to Qwen.
-9. **Some older guides are stale.** The existing UI/voice guides still
-   include `shutdown EDITH` wording, while the current command implementation
-   accepts exact `exit`. A voice guide also records different endpoint
-   defaults and a 1,800 MB GPU threshold; the current `EndpointConfig` and
-   `STTConfig` defaults are authoritative (the latter currently specifies
-   1,200 MB). Consult source.
+9. **Some lifecycle command wording in older guides may be stale.** The
+   current command implementation and source are authoritative. Audio
+   denoising and STT defaults are documented in the voice-system guide;
+   verify them against `STTConfig` when changing the implementation.
 10. **Thread failure boundaries need care.** Queue joins can block if their
     consumers fail before marking queued items complete; see Chapter 12.
 11. **No performance figures.** No RAM/VRAM benchmark or full-session soak

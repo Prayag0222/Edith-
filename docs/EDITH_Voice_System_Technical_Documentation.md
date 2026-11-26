@@ -45,6 +45,12 @@ seven-second idle timeout, return to wake mode, post-TTS microphone
 cleanup and clean shutdown. The lifecycle commands described below are
 the current behavior.
 
+The November 2026 audio update adds CPU-only GTCRN denoising before STT,
+CPU/int8 Faster-Whisper defaults, a silence/no-speech guard, and a Silero
+VAD gate plus two-hit debounce for wake detection. Focused runtime checks
+are recorded in Section 16. The repository test suite and live microphone
+accuracy were not independently run for that update.
+
 This is evidence from the user's machine and tests, not a guarantee
 across every microphone, room or acoustic environment.
 
@@ -54,10 +60,12 @@ across every microphone, room or acoustic environment.
 
 -   Shared microphone capture and audio distribution.
 -   Audio buffering and basic processing.
+-   Optional GTCRN denoising of 16 kHz utterances before STT.
 -   Wake-word adapter around the existing detector.
+-   VAD-gated wake scores with threshold and consecutive-hit debounce.
 -   Silero VAD.
 -   Adaptive endpoint detection and speech segments.
--   Faster-Whisper integration and model selection.
+-   CPU/int8 Faster-Whisper integration, lazy model cache and noise guard.
 -   `VoiceEngine` wake/conversation state.
 -   Seven-second speech-start timeout.
 -   Existing Piper TTS orchestration in `main.py`.
@@ -72,8 +80,9 @@ across every microphone, room or acoustic environment.
 -   Barge-in / interrupting Piper playback.
 -   Partial or streaming STT.
 -   Wake-word retraining or threshold tuning.
--   GPU model unloading/reloading coordination between Ollama and
-    Whisper.
+-   Whisper GPU inference. The active `SpeechToTextEngine` explicitly
+    requests CPU/int8; the model manager's generic GPU selector is not
+    used on this path.
 -   Full acoustic echo cancellation (AEC).
 
 Do not accidentally treat future ideas as capabilities already
@@ -103,7 +112,7 @@ implemented.
        |                          |
        v                          v
  WakeWordAdapter            AudioSubscription
- Legacy detector                  |
+ raw audio + VAD gate             |
                                   v
                          AdaptiveEndpointDetector
                                   |
@@ -113,8 +122,11 @@ implemented.
                           Completed SpeechSegment
                                   |
                                   v
+                    AudioProcessor / GTCRN CPU
+                                   |
+                                   v
                          SpeechToTextEngine
-                          Faster-Whisper
+                      Faster-Whisper CPU/int8
                                   |
                               Transcript
                                   |
@@ -161,6 +173,7 @@ D:\Edith\
 │   │   │   └── audio_buffer.py
 │   │   ├── processing\
 │   │   │   ├── audio_processor.py
+│   │   │   ├── denoiser.py
 │   │   │   └── resampler.py
 │   │   ├── detection\
 │   │   │   ├── silero_vad.py
@@ -177,6 +190,8 @@ D:\Edith\
 │   │   └── tests\
 │   └── ... assistant, LLM, conversation and memory modules
 └── models\
+    ├── denoiser\
+    │   └── gtcrn_simple.onnx
     └── wakeword\
         └── hey_edith.onnx
 ```
@@ -291,10 +306,27 @@ MB (about 36.6 MiB), excluding Python overhead and allocation strategy.
 
 ## 6.3 Audio processor
 
-The audio processor exposes non-destructive measurements such as RMS,
-peak amplitude, clipping ratio and silence/low-energy indication.
-Aggressive denoising is not automatically beneficial: quieter audio is
-not necessarily more intelligible to STT.
+`AudioProcessor` exposes RMS, peak amplitude, clipping ratio and a
+silence/low-energy indication. For STT input, its `process()` method
+passes normalized 16 kHz float32 utterances through the optional GTCRN
+denoiser before transcription. The STT engine checks the processed
+audio's RMS and skips it when it is below the existing `0.002` silence
+threshold.
+
+### GTCRN denoiser
+
+`app/voice_v2/processing/denoiser.py` loads
+`models/denoiser/gtcrn_simple.onnx` lazily and retains one
+`OfflineSpeechDenoiser` instance for the process. It explicitly uses
+`provider="cpu"` and one inference thread. `DENOISE_ENABLED` defaults to
+`True`; audio not at 16 kHz bypasses denoising. If sherpa-onnx or the
+model is missing, loading fails, or inference fails, the denoiser logs
+the condition and returns the raw audio rather than stopping STT.
+
+Denoising is applied only to completed utterances before STT. The
+`hey_edith.onnx` wake-word path continues to receive raw audio; GTCRN is
+not run on the wake stream. `denoise_ms` includes lazy model loading on
+the first processed utterance.
 
 ## 6.4 Resampling
 
@@ -333,11 +365,19 @@ The adapter:
 
 1.  Receives shared float32 samples.
 2.  Validates finite values.
-3.  Converts to clipped int16 PCM.
-4.  Feeds the legacy detector's audio buffer.
-5.  Checks at its configured interval.
-6.  Applies the detector's RMS gate, threshold and cooldown.
-7.  Returns `True` on detection.
+3.  Passes raw float32 samples to the shared Silero VAD for the speech
+    gate; the wake model itself still receives raw audio.
+4.  Converts samples to clipped int16 PCM.
+5.  Preserves the legacy detector calls (`_add_audio`,
+    `_get_audio_window`, `_calculate_rms`, `_detect`).
+6.  Checks at its configured interval, applies the RMS gate, then
+    requires the configurable wake threshold and consecutive-hit count.
+7.  Applies the existing detector cooldown and returns `True` on
+    detection.
+
+The active `VoiceEngine` shares the same `SileroVAD` instance between
+the adapter and endpoint detector; it does not create another microphone
+stream or a second VAD model.
 
 The adapter does not open a microphone. It currently uses private
 methods on the legacy detector (`_add_audio`, `_get_audio_window`,
@@ -357,6 +397,19 @@ change, update and test the adapter in the same change.
 7.  Reads shared microphone blocks.
 8.  Sends blocks to the adapter.
 9.  Sets `_wake_detected = True` and returns on detection.
+
+## 7.5 Wake noise gate and debounce
+
+The adapter defaults to a wake score threshold of `0.94`, a Silero
+speech-probability threshold of `0.55`, two consecutive qualifying
+detector checks, and a one-second recency window for VAD speech. These
+are constructor settings on `WakeWordAdapter`. A missing VAD is kept
+compatible for standalone adapter callers, but the normal `VoiceEngine`
+path injects its shared VAD and applies the gate.
+
+The VAD gate reduces activations from non-speech noise; it is not a
+guarantee against every noise source or a substitute for testing the
+microphone in the target room.
 
 # 8. Silero VAD
 
@@ -528,23 +581,29 @@ result.
 
 ## 10.2 Recorded configuration
 
-  Setting                      Recorded value
-  ---------------------------- ----------------
+  Setting                      Current value
+  ---------------------------- --------------------------------------
   Model                        `small`
   Sample rate                  16 kHz
-  Device preference            `auto`
+  Device preference            `cpu`
   CPU compute                  `int8`
-  GPU compute                  `float16`
+  CPU threads                  6
   Task                         `transcribe`
-  Beam size                    5
+  Beam size                    2
+  Temperature                  0.0
+  Initial prompt               `EDITH, Prayag, Python, Ollama, VS Code.`
+  No-speech threshold          0.6
   VAD filter                   False
   Condition on previous text   False
   Local files only             True
-  Minimum free VRAM for GPU    1,800 MB
-  Maximum GPU utilization      75%
   Inference lock               Enabled
 
-Check the current `STTConfig` for the exact live values.
+`SpeechToTextEngine` calls `get_cpu_model()` directly, so the active voice
+path does not select CUDA, regardless of the model manager's generic
+GPU-selection support. Segments with `no_speech_prob >= 0.6` are
+discarded. Empty/low-energy processed audio is skipped before loading or
+running Whisper. `stt_ms` records model acquisition and transcription
+time.
 
 ## 10.3 Model manager
 
@@ -553,18 +612,18 @@ Check the current `STTConfig` for the exact live values.
 -   Loads lazily.
 -   Keeps one active Whisper model cache entry.
 -   Uses locking around model lifecycle/inference.
--   Selects CUDA FP16 when its GPU checks pass.
--   Otherwise selects CPU int8.
--   Can fall back to CPU after GPU load/inference failure.
+-   Receives explicit CPU/int8 requests from `SpeechToTextEngine`.
+-   Passes the configured six CPU threads to Faster-Whisper.
+-   Retains generic device-selection methods for other callers, but the
+    active voice STT path does not use them.
 
-The selector uses CTranslate2 CUDA visibility and `nvidia-smi`
-information.
-
-## 10.4 Hardware observations and deferred work
+## 10.4 Hardware observations
 
 Hardware: NVIDIA RTX 3050 Laptop GPU, 4 GB VRAM.
 
-Recorded observations:
+The active voice STT path is CPU/int8 to keep Whisper inference off the
+GPU. Earlier CUDA timing observations below predate that change and are
+historical only:
 
 -   CUDA FP16: roughly 0.53--0.71 seconds for 6--10 seconds of audio
     under favourable VRAM conditions.
@@ -572,9 +631,10 @@ Recorded observations:
 -   When Ollama occupied most VRAM, Whisper selected CPU int8; measured
     8--10 second audio took approximately 2.56--2.68 seconds.
 
-These measurements are machine- and workload-specific. GPU coordination
-and model unload/reload were explicitly deferred. Do not alter STT/GPU
-policy while debugging unrelated wake or endpoint issues.
+Those measurements are machine- and workload-specific and do not
+describe the current CPU-only voice path. A focused runtime check loaded
+the cached `small` model as CPU/int8; synthetic non-speech audio produced
+no transcript.
 
 ## 10.5 Result and Windows DLL handling
 
@@ -741,13 +801,13 @@ completed playback.
 Commands are normalized for case, punctuation, and repeated whitespace, and
 matched exactly before LLM generation:
 
-- `sleep`, `stop`, `go to sleep`, and `exit`: return to wake-word mode.
+- `sleep`, `stop`, and `go to sleep`: return to wake-word mode.
 - `hibernate`: return to wake-word mode and release the cached Whisper model.
-- `shutdown EDITH`: speak "Goodbye." and perform a full application shutdown.
+- `exit`: perform a graceful application shutdown.
 
 The default inactivity hibernation period is 300 seconds and is configurable
-with `EDITH_HIBERNATE_AFTER_SECONDS`. Only `shutdown EDITH` ends the process;
-closing the overlay hides it, and does not stop the voice engine.
+with `EDITH_HIBERNATE_AFTER_SECONDS`. `exit` ends the process. Closing the
+overlay hides it without stopping the voice engine.
 
 # 13. TTS self-transcription prevention
 
@@ -856,23 +916,22 @@ engine that does not own them.
 
 Recorded environment:
 
-  Item            Recorded value
-  --------------- ----------------------------------
-  OS              Windows 11
-  Python          3.13.2
-  Venv            `D:\Edith\.venv`
-  GPU             NVIDIA RTX 3050 Laptop GPU, 4 GB
-  Audio capture   `sounddevice`
-  Arrays          NumPy
-  VAD             `silero-vad`, ONNX mode
-  Runtime         `onnxruntime`
-  STT             `faster-whisper` / CTranslate2
-  GPU STT         CUDA FP16 when selected
-  CPU fallback    int8
-  Resampling      `python-soxr`
-  TTS             Existing Piper implementation
-  Wake model      ONNX `hey_edith.onnx`
-  Local LLM       Ollama `llama3.2:3b`
+  Item             Recorded value
+  ---------------- ---------------------------------------------
+  OS               Windows 11
+  Python           3.13.2
+  Venv             `D:\Edith\.venv`
+  GPU              NVIDIA RTX 3050 Laptop GPU, 4 GB
+  Audio capture    `sounddevice`
+  Arrays           NumPy
+  VAD              `silero-vad`, ONNX mode
+  Runtime          `onnxruntime`
+  STT              `faster-whisper` / CTranslate2, CPU/int8
+  Denoiser         `sherpa-onnx` 2.0.3 / GTCRN, CPU
+  Wake model       ONNX `hey_edith.onnx` (raw audio)
+  Resampling       `python-soxr`
+  TTS              Existing Piper implementation
+  Local LLM        Ollama `llama3.2:3b`
 
 Exact package versions in the current dependency file and active
 environment are authoritative.
@@ -887,9 +946,23 @@ python --version
 python -c "import sys; print(sys.executable)"
 python -c "import numpy, sounddevice, torch, onnxruntime; print('core imports OK')"
 python -c "from silero_vad import load_silero_vad; m=load_silero_vad(onnx=True); print(type(m)); print(callable(m))"
-python -c "import ctranslate2; print(ctranslate2.get_cuda_device_count())"
+python -c "import sherpa_onnx; print('sherpa_onnx import OK')"
 python -m pytest app/voice_v2/tests/ -v
 ```
+
+For GTCRN denoising, install sherpa-onnx in the active environment and
+place the model at the path expected by the code:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install sherpa-onnx
+New-Item -ItemType Directory -Force models\denoiser | Out-Null
+Invoke-WebRequest `
+  -Uri "https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/gtcrn_simple.onnx" `
+  -OutFile "models\denoiser\gtcrn_simple.onnx"
+```
+
+The checked environment used sherpa-onnx 2.0.3. If the package or model
+is absent, the documented raw-audio fallback is used.
 
 # 16. Test history and acceptance evidence
 
@@ -913,7 +986,8 @@ pause were included in one transcript.
 
 ## 16.3 STT and integration
 
--   CTranslate2 CUDA device visibility and FP16 support confirmed.
+-   Historical pre-CPU-lock check: CTranslate2 CUDA visibility and FP16
+    support were confirmed. The active voice path no longer uses CUDA.
 -   Integrated wake-to-transcription test recognized a question.
 -   Integration suite reported `29 passed`.
 -   Historical manual checks before lifecycle command changes: `Exit.`
@@ -930,14 +1004,37 @@ The user's runtime log showed:
 -   Seven seconds of no speech caused sleep/return to wake mode.
 -   A later wake phrase was detected.
 -   In the earlier command mapping, `Exit.` was recognized as shutdown.
--   The current exact shutdown command is `shutdown EDITH`.
+-   The current exact shutdown command is `exit`.
 
 ## 16.5 TTS cleanup
 
 The user reported that the post-playback cleanup change resolved the
 observed final-word self-transcription issue.
 
-## 16.6 Regression checklist
+## 16.6 November 2026 CPU-audio update checks
+
+-   **PASS:** Loaded GTCRN on CPU and processed 16 kHz synthetic audio
+    twice; output was finite float32 with the expected sample count.
+-   **PASS:** Processed GTCRN output through the STT integration using a
+    stub recognizer; confirmed decoding parameters, CPU result metadata,
+    and silence/no-speech rejection.
+-   **PASS:** Loaded the cached Faster-Whisper `small` model and ran a
+    synthetic non-speech input on CPU/int8; the model loaded and returned
+    no transcript.
+-   **PASS:** Real Silero VAD plus a stub wake detector rejected silence;
+    two consecutive high scores with speech-gate approval triggered the
+    adapter in a separate focused check.
+-   **PASS:** `VoiceEngine` smoke check confirmed its wake adapter and
+    endpoint detector share the same VAD instance.
+-   **VRAM observation:** `nvidia-smi` reported 71 MiB before and after
+    the CPU inference check; this is a point observation, not a benchmark
+    or a claim that the machine's total VRAM use was zero.
+-   **NOT independently tested in this session:** Full repository pytest
+    suite, real microphone accuracy, and a live "Hey EDITH" utterance.
+    The user subsequently reported that EDITH was working in manual use,
+    but did not provide case-by-case results or a test log.
+
+## 16.7 Regression checklist
 
 -   [ ] Correct `.venv` interpreter.
 -   [ ] Only one microphone stream.
@@ -950,10 +1047,14 @@ observed final-word self-transcription issue.
 -   [ ] More than seven seconds of silence returns to wake mode.
 -   [ ] EDITH's playback is not transcribed as user speech.
 -   [ ] A real question immediately after cleanup is captured.
--   [ ] `sleep`, `stop`, `go to sleep`, and `exit` return to wake-word mode.
+-   [ ] `sleep`, `stop`, and `go to sleep` return to wake-word mode.
 -   [ ] `hibernate` releases Whisper and a later wake reloads it on demand.
+-   [ ] GTCRN model loads once on CPU and denoises 16 kHz speech before STT.
+-   [ ] Missing GTCRN package/model falls back to raw audio without stopping STT.
+-   [ ] Non-speech noise alone does not pass the Silero wake gate.
+-   [ ] Whisper inference reports CPU/int8 and does not increase VRAM use.
 -   [ ] Closing the overlay hides it without stopping EDITH.
--   [ ] `shutdown EDITH` closes all services cleanly.
+-   [ ] `exit` closes all services cleanly.
 -   [ ] A second launch is rejected without opening another microphone.
 -   [ ] Voice, TTS and memory worker close cleanly.
 -   [ ] No unexpected audio overflow/drop growth.
@@ -963,9 +1064,11 @@ observed final-word self-transcription issue.
 ## A. Wake phrase not detected
 
 Check microphone stream state, subscription block count, model path,
-sample format, RMS gate, threshold and cooldown. Confirm the adapter
-receives 16 kHz mono float32 before conversion to int16. Do not retrain
-the frozen model without a reproducible controlled failure.
+sample format, RMS gate, VAD speech evidence, the adapter's 0.94
+threshold, consecutive-hit setting and existing cooldown. Confirm the
+adapter receives 16 kHz mono float32 and feeds the unchanged raw samples
+to the legacy detector. Do not retrain the frozen model without a
+reproducible controlled failure.
 
 ## B. Wake detected but no transcription
 
@@ -1008,12 +1111,12 @@ first/second discard, settling interval, endpoint reset and subscription
 identity. If all are correct, investigate acoustic coupling or AEC. Do
 not add arbitrary delays without measuring.
 
-## G. STT moves from CUDA to CPU
+## G. Whisper uses CPU/int8
 
-Inspect free VRAM, GPU utilization, Ollama usage, model manager's
-selection reason, CTranslate2 CUDA visibility and Windows DLL paths. CPU
-selection may be expected below the configured 1,800 MB free-VRAM
-threshold. Do not unload/reload models as an unrelated fix.
+The active voice path explicitly requests CPU/int8 with six threads.
+Inspect the STT timing logs and model-manager decision. Generic GPU
+selection in `WhisperModelManager` is not used by
+`SpeechToTextEngine.transcribe()`.
 
 ## H. Audio overflows or drops
 
@@ -1027,6 +1130,22 @@ while adding latency; do not increase them indefinitely.
 The runtime diagnostic showed `OnnxWrapper` and
 `callable(model) == True`. Verify installed package/runtime. Treat it as
 a typing issue unless runtime inference actually fails.
+
+## J. GTCRN denoising is inactive
+
+Check that the active interpreter can import `sherpa_onnx` and that
+`models/denoiser/gtcrn_simple.onnx` exists. The first denoised utterance
+loads the model lazily; logs distinguish missing/invalid model setup and
+inference failures. Either condition falls back to raw audio. Confirm
+that the input sample rate is 16 kHz.
+
+## K. STT device or latency differs from expectation
+
+The active voice path requests CPU/int8 and six CPU threads. Check the
+`STT` timing log for `denoise_ms` and `stt_ms`; the first denoise timing
+includes GTCRN model loading, while the STT timing includes Whisper model
+acquisition. Do not infer inference-device selection from generic
+`GPUResourceSelector` capabilities.
 
 # 18. Safe change protocol
 
@@ -1047,7 +1166,7 @@ Rules:
 -   Preserve the single-microphone-stream design.
 -   Never add a second microphone stream for wake detection.
 -   Do not tune VAD to compensate for a main-loop state bug.
--   Do not modify STT/GPU policy while debugging endpointing.
+-   Do not change the CPU/int8 STT policy while debugging endpointing.
 -   Do not modify Piper while debugging capture unless evidence points
     to TTS.
 -   Keep orchestration in `main.py` and voice-input lifecycle in
@@ -1064,7 +1183,9 @@ Rules:
 3.  No speaker verification.
 4.  Queue discard plus settling is not full AEC.
 5.  Background noise can still trigger VAD.
-6.  Ollama and Whisper share limited VRAM; Whisper may fall back to CPU.
+6.  The active Whisper path is CPU/int8 and may be slower than GPU
+    inference; synthetic-audio smoke checks do not establish recognition
+    accuracy for real speech.
 7.  Wake adapter depends on private methods in the legacy detector.
 8.  Microphone gain, speaker volume, room echo and drivers affect
     results.
@@ -1096,6 +1217,13 @@ These should be isolated extensions, not bundled into routine bug fixes.
   Audio          Block duration                     20 ms
   Audio          Samples/block                        320
   Wake adapter   Check interval                    0.25 s
+  Wake adapter   Score threshold                    0.94
+  Wake adapter   Required consecutive hits              2
+  Wake adapter   VAD speech threshold               0.55
+  Denoiser       Enabled                               True
+  Denoiser       Sample rate                      16 kHz only
+  Denoiser       Provider / threads             CPU / 1
+  Denoiser       Model path       `models/denoiser/gtcrn_simple.onnx`
   Endpoint       Pre-roll                           0.5 s
   Endpoint       Start threshold                     0.55
   Endpoint       Continue threshold                  0.35
@@ -1109,9 +1237,11 @@ These should be isolated extensions, not bundled into routine bug fixes.
   VoiceEngine    Speech-start timeout                 7 s
   TTS cleanup    Settling period                    0.5 s
   STT            Model                              small
-  STT            GPU compute                      float16
   STT            CPU compute                         int8
-  STT            Minimum free VRAM               1,800 MB
+  STT            CPU threads                            6
+  STT            Beam size                              2
+  STT            Temperature                          0.0
+  STT            No-speech threshold                   0.6
 
 If the repository differs, trust the current source/config.
 
@@ -1130,9 +1260,9 @@ EDITH is ready — Local AI: Online
 
 Continuous Conversation Mode enabled.
 Say 'Hey EDITH' to start.
-Say 'sleep', 'stop', 'go to sleep', or 'exit' to wait.
+Say 'sleep', 'stop', or 'go to sleep' to wait.
 Say 'hibernate' to release the Whisper model.
-Say 'shutdown EDITH' to stop.
+Say 'exit' to stop EDITH.
 
 [READY] Waiting for wake word...
 ```
@@ -1150,7 +1280,7 @@ Smoke test:
 9.  Say "Hey EDITH" again.
 10. Say "hibernate" and confirm wake-word monitoring remains available.
 11. Say "Hey EDITH" and confirm the Whisper model reloads on transcription.
-12. Say "shutdown EDITH" and confirm clean shutdown.
+12. Say "exit" and confirm clean shutdown.
 
 Test suite:
 

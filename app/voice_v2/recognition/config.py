@@ -3,11 +3,15 @@ from dataclasses import dataclass
 class STTConfig:
     model_size: str = "small"
     sample_rate: int = 16000
-    device_preference: str = "auto"
+    device_preference: str = "cpu"
     cpu_compute_type: str = "int8"
+    cpu_threads: int = 6
     language: str | None = None
     task: str = "transcribe"
-    beam_size: int = 5
+    beam_size: int = 2
+    temperature: float = 0.0
+    initial_prompt: str = "EDITH, Prayag, Python, Ollama, VS Code."
+    no_speech_threshold: float = 0.6
     vad_filter: bool = False
     condition_on_previous_text: bool = False
     local_files_only: bool = True
@@ -21,5 +25,8 @@ class STTConfig:
         if self.device_preference not in {"auto", "cuda", "cpu"}: raise ValueError("Invalid device_preference")
         if self.task not in {"transcribe", "translate"}: raise ValueError("Invalid task")
         if self.beam_size < 1: raise ValueError("beam_size must be >= 1")
+        if self.cpu_threads < 1: raise ValueError("cpu_threads must be >= 1")
+        if self.temperature < 0: raise ValueError("temperature cannot be negative")
+        if not 0 <= self.no_speech_threshold <= 1: raise ValueError("Invalid no_speech_threshold")
         if self.gpu_min_free_vram_mb < 0: raise ValueError("Invalid VRAM threshold")
         if not 0 <= self.gpu_max_utilization <= 100: raise ValueError("Invalid GPU utilization threshold")

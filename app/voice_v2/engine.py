@@ -121,15 +121,20 @@ class VoiceEngine:
 
             self._audio_service = AudioInputService(audio_config)
 
-        if self._wake_adapter is None:
-            self._wake_adapter = WakeWordAdapter()
-
         if self._vad is None:
-            self._vad = SileroVAD(
-                SileroVADConfig(
-                    sample_rate=self.config.sample_rate
+            if isinstance(self._wake_adapter, WakeWordAdapter):
+                self._vad = self._wake_adapter.vad
+            if self._vad is None:
+                self._vad = SileroVAD(
+                    SileroVADConfig(
+                        sample_rate=self.config.sample_rate
+                    )
                 )
-            )
+
+        if self._wake_adapter is None:
+            self._wake_adapter = WakeWordAdapter(vad=self._vad)
+        elif isinstance(self._wake_adapter, WakeWordAdapter):
+            self._wake_adapter.vad = self._vad
 
         self._endpoint = AdaptiveEndpointDetector(
             self._vad,
