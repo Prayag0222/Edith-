@@ -2,10 +2,18 @@ import re
 import queue
 import threading
 import logging
+from contextlib import ExitStack
 
 import webview
 
-from app.core.commands import is_exit_command, is_sleep_command
+from app.core.commands import (
+    is_hibernate_command,
+    is_shutdown_command,
+    is_sleep_command,
+)
+from app.core.config import Settings
+from app.core.lifecycle import ApplicationLifecycle, SingleInstanceGuard
+from app.ui.system_tray import EdithSystemTray
 from app.llm.client import OllamaClient
 from app.conversation.service import ConversationService
 from app.core.assistant import EdithAssistant
@@ -110,6 +118,45 @@ def speech_worker(tts, speech_queue):
         logger.exception("TTS worker failed")
 
 
+def play_startup_greeting_once(
+    tts,
+    voice,
+    desktop,
+    tray,
+    greeting,
+    greeting_played,
+):
+    if greeting_played.is_set():
+        return False
+
+    if not voice.get_stats().get("running"):
+        raise RuntimeError("Microphone is not ready for the startup greeting.")
+
+    if not tray.is_ready:
+        raise RuntimeError("EDITH tray icon is not ready for the startup greeting.")
+
+    if not desktop._ready.wait(timeout=desktop.BRIDGE_TIMEOUT):
+        greeting_played.set()
+        logger.warning(
+            "Startup greeting skipped because the EDITH UI bridge is not ready"
+        )
+        return False
+
+    if not str(greeting).strip():
+        greeting_played.set()
+        logger.info("EDITH startup greeting is disabled")
+        return False
+
+    greeting_played.set()
+    try:
+        tts.speak(greeting)
+    except Exception:
+        logger.exception("EDITH startup greeting failed")
+        return False
+
+    return True
+
+
 # --------------------------------------------------
 # MAIN ASSISTANT LOOP
 # --------------------------------------------------
@@ -122,9 +169,11 @@ def run_assistant(
     tts,
     memory_manager,
     ui,
+    lifecycle,
+    request_shutdown,
 ):
 
-    while True:
+    while not lifecycle.is_shutting_down:
 
         # ----------------------------------------------
         # SLEEP / WAKE MODE
@@ -134,6 +183,9 @@ def run_assistant(
 
         if not voice.wait_for_wake_word():
             continue
+
+        if not lifecycle.activate():
+            return
 
         print("[WAKE] Wake word detected.")
 
@@ -161,6 +213,7 @@ def run_assistant(
 
                 # Hide the popup without stopping EDITH.
                 ui.sleep()
+                lifecycle.sleep()
 
                 break
 
@@ -180,6 +233,7 @@ def run_assistant(
                 continue
 
             print(f"You: {user_input}")
+            lifecycle.note_interaction()
 
             # ------------------------------------------
             # SLEEP COMMAND
@@ -192,15 +246,36 @@ def run_assistant(
                 )
 
                 voice.return_to_wake_word_mode()
+                lifecycle.sleep()
                 ui.sleep()
 
                 break
 
             # ------------------------------------------
-            # EXIT COMMAND
+            # HIBERNATE COMMAND
             # ------------------------------------------
 
-            if is_exit_command(user_input):
+            if is_hibernate_command(user_input):
+
+                print("[HIBERNATE] Releasing the Whisper model cache.")
+
+                voice.return_to_wake_word_mode()
+                lifecycle.sleep()
+                ui.sleep()
+                try:
+                    lifecycle.hibernate_now()
+                except Exception:
+                    logger.warning(
+                        "Manual hibernation failed; EDITH remains in wake-word mode."
+                    )
+
+                break
+
+            # ------------------------------------------
+            # SHUTDOWN COMMAND
+            # ------------------------------------------
+
+            if is_shutdown_command(user_input):
 
                 print("EDITH: Goodbye.")
 
@@ -210,7 +285,9 @@ def run_assistant(
                     tts.speak("Goodbye.")
 
                 finally:
-                    return
+                    request_shutdown()
+
+                return
 
             # ------------------------------------------
             # THINKING
@@ -318,8 +395,13 @@ def assistant_runtime(
     voice,
     tts,
     memory_manager,
-    memory_worker,
     ui,
+    lifecycle,
+    desktop,
+    tray,
+    startup_greeting,
+    greeting_played,
+    request_shutdown,
 ):
 
     """
@@ -330,6 +412,14 @@ def assistant_runtime(
     """
 
     try:
+        play_startup_greeting_once(
+            tts,
+            voice,
+            desktop,
+            tray,
+            startup_greeting,
+            greeting_played,
+        )
 
         run_assistant(
             edith,
@@ -339,6 +429,8 @@ def assistant_runtime(
             tts,
             memory_manager,
             ui,
+            lifecycle,
+            request_shutdown,
         )
 
     except Exception:
@@ -346,27 +438,7 @@ def assistant_runtime(
         logger.exception("EDITH encountered an unexpected error")
 
     finally:
-
-        print("\n[SHUTDOWN] Closing EDITH...")
-
-        try:
-            voice.close()
-
-        finally:
-
-            try:
-                tts.close()
-
-            finally:
-
-                try:
-                    memory_worker.close()
-
-                finally:
-
-                    ui.close()
-
-        print("[SHUTDOWN] EDITH closed.")
+        request_shutdown()
 
 
 # --------------------------------------------------
@@ -375,92 +447,143 @@ def assistant_runtime(
 
 def main():
 
-    # ----------------------------------------------
-    # INITIALIZE EXISTING EDITH COMPONENTS
-    # ----------------------------------------------
+    instance_guard = SingleInstanceGuard()
+    if not instance_guard.acquire():
+        logger.warning("EDITH is already running; ignoring duplicate launch.")
+        print("EDITH is already running.")
+        return
 
-    edith = EdithAssistant()
+    with ExitStack() as cleanup:
+        cleanup.callback(instance_guard.close)
 
-    llm = OllamaClient(edith)
+        edith = EdithAssistant()
 
-    voice = VoiceEngine()
+        llm = OllamaClient(edith)
 
-    tts = TextToSpeech()
+        voice = VoiceEngine()
+        cleanup.callback(voice.close)
 
-    memory = MemoryService()
+        tts = TextToSpeech()
+        cleanup.callback(tts.close)
 
-    memory_manager = MemoryManager(llm)
+        memory = MemoryService()
 
-    memory_worker = BackgroundMemoryWorker(
-        memory,
-        memory_manager,
-        llm,
-    )
+        memory_manager = MemoryManager(llm)
 
-    conversation = ConversationService(
-        memory,
-        memory_worker,
-    )
-
-    # ----------------------------------------------
-    # INITIALIZE DESKTOP UI
-    # ----------------------------------------------
-
-    desktop = EdithDesktopWindow()
-
-    desktop.create()
-
-    ui = EdithUIController(desktop)
-
-    # ----------------------------------------------
-    # STARTUP STATUS
-    # ----------------------------------------------
-
-    if llm.is_available():
-
-        print("EDITH is ready — Local AI: Online\n")
-
-    else:
-
-        print("EDITH is ready — Local AI: Offline\n")
-
-    print("Continuous Conversation Mode enabled.")
-    print("Say 'Hey EDITH' to start.")
-    print("Say 'sleep' to wait for the wake word.")
-    print("Say 'exit' to stop.\n")
-
-    # ----------------------------------------------
-    # START ASSISTANT THREAD
-    # ----------------------------------------------
-
-    assistant_thread = threading.Thread(
-        target=assistant_runtime,
-        args=(
-            edith,
-            llm,
-            conversation,
-            voice,
-            tts,
+        memory_worker = BackgroundMemoryWorker(
+            memory,
             memory_manager,
+            llm,
+        )
+        cleanup.callback(memory_worker.close)
+
+        conversation = ConversationService(
+            memory,
             memory_worker,
-            ui,
-        ),
-        name="EDITH-Assistant",
-        daemon=True,
-    )
+        )
 
-    assistant_thread.start()
+        desktop = EdithDesktopWindow()
+        cleanup.callback(desktop.close)
+        desktop.create()
 
-    # ----------------------------------------------
-    # START DESKTOP EVENT LOOP
-    # ----------------------------------------------
+        ui = EdithUIController(desktop)
+        cleanup.callback(ui.close)
 
-    # pywebview manages the main GUI thread.
-    # The assistant runs independently in assistant_thread.
-    webview.start()
+        tray = None
 
-    # Wait for the assistant thread to finish after GUI exits.
-    assistant_thread.join()
+        def update_tray_status(mode):
+            if tray is not None:
+                tray.set_status(mode)
+
+        lifecycle = ApplicationLifecycle(
+            Settings.HIBERNATE_AFTER_SECONDS,
+            voice.hibernate,
+            on_mode_change=update_tray_status,
+        )
+        cleanup.callback(lifecycle.shutdown)
+
+        def request_shutdown():
+            lifecycle.shutdown()
+            ui.close()
+
+        cleanup.callback(request_shutdown)
+
+        tray = EdithSystemTray(
+            Settings.TRAY_ICON_PATH,
+            open_ui=desktop.show,
+            hide_ui=desktop.hide,
+            exit_application=request_shutdown,
+            initial_status=lifecycle.mode,
+        )
+        cleanup.callback(tray.stop)
+
+        voice.start()
+        if not voice.get_stats().get("running"):
+            raise RuntimeError("EDITH microphone stream did not start.")
+        lifecycle.start()
+        tray.start()
+
+        # ----------------------------------------------
+        # STARTUP STATUS
+        # ----------------------------------------------
+
+        if llm.is_available():
+
+            print("EDITH is ready — Local AI: Online\n")
+
+        else:
+
+            print("EDITH is ready — Local AI: Offline\n")
+
+        print("Continuous Conversation Mode enabled.")
+        print("Say 'Hey EDITH' to start.")
+        print("Say 'sleep', 'stop', or 'go to sleep' to wait.")
+        print("Say 'hibernate' to release the Whisper model.")
+        print("Say 'exit' to stop EDITH.\n")
+
+        greeting_played = threading.Event()
+
+        # ----------------------------------------------
+        # START ASSISTANT THREAD
+        # ----------------------------------------------
+
+        assistant_thread = threading.Thread(
+            target=assistant_runtime,
+            args=(
+                edith,
+                llm,
+                conversation,
+                voice,
+                tts,
+                memory_manager,
+                ui,
+                lifecycle,
+                desktop,
+                tray,
+                Settings.STARTUP_GREETING,
+                greeting_played,
+                request_shutdown,
+            ),
+            name="EDITH-Assistant",
+            daemon=True,
+        )
+
+        assistant_started = False
+        try:
+            assistant_thread.start()
+            assistant_started = True
+
+            # pywebview manages the main GUI thread.
+            webview.start()
+
+        finally:
+            request_shutdown()
+            if assistant_started:
+                try:
+                    if assistant_thread.is_alive():
+                        voice.close()
+                finally:
+                    assistant_thread.join()
 
 
 # --------------------------------------------------

@@ -52,6 +52,7 @@ class EdithDesktopWindow:
         self.window = None
         self._ready = threading.Event()
         self._closed = False
+        self._allow_close = False
 
     def _get_window_position(self):
         user32 = ctypes.windll.user32
@@ -87,6 +88,7 @@ class EdithDesktopWindow:
             raise RuntimeError("Failed to create EDITH desktop window.")
 
         self.window.events.loaded += self._on_loaded
+        self.window.events.closing += self._on_closing
         self.window.events.closed += self._on_closed
 
         logger.info("EDITH overlay created at (%s, %s)", x, y)
@@ -222,6 +224,21 @@ class EdithDesktopWindow:
         self._closed = True
         logger.info("EDITH desktop interface closed")
 
+    def _on_closing(self):
+        if self._allow_close:
+            return True
+
+        if self.window is not None and not self._closed:
+            try:
+                self.window.hide()
+                logger.info(
+                    "EDITH desktop window hidden; assistant remains running"
+                )
+            except Exception:
+                logger.exception("Could not hide EDITH desktop window on close")
+
+        return False
+
     def show(self):
         if self.window is None or self._closed:
             return
@@ -279,6 +296,7 @@ class EdithDesktopWindow:
     def close(self):
         if self.window is None or self._closed:
             return
+        self._allow_close = True
         self._closed = True
         try:
             self.window.destroy()

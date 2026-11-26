@@ -129,6 +129,28 @@ D:\Edith\.venv\Scripts\python.exe -m app.main
 
 The frontend production build must exist before launching the Python application. The Python host runs the assistant in a background thread while pywebview owns the desktop UI event loop.
 
+### Desktop lifecycle and launch modes
+
+`Start_EDITH.bat` is the visible/debug launcher. `start_edith.vbs` starts
+that same batch file in hidden mode; Python output is appended to
+`%LOCALAPPDATA%\EDITH\logs\edith.log`. The application acquires a Windows
+named mutex before initializing audio, TTS, memory, or the desktop window, so
+a second launch exits without opening another microphone stream.
+
+Closing the overlay's native window hides it and keeps the assistant and
+pywebview event loop running. Voice commands `sleep`, `stop`, `go to sleep`,
+and `exit` return to wake-word mode and hide the overlay. `hibernate` also
+releases the cached Whisper model while preserving the microphone and wake
+detector; the model is loaded lazily after the next wake. After the configured
+inactivity period, the same Whisper-only hibernation happens automatically.
+The default is 300 seconds and can be changed with
+`EDITH_HIBERNATE_AFTER_SECONDS`.
+
+Only the exact command `shutdown EDITH` performs a full shutdown. It lets the
+goodbye speech finish, closes the UI and backend services, then releases the
+single-instance guard. Closing the window is intentionally not a shutdown
+action.
+
 ## 5. Frontend startup
 
 ### 5.1 HTML and React entry
@@ -362,7 +384,7 @@ Accessibility support includes a polite live region for response text and a desc
    ```
 
 5. Confirm `edith-ui/dist/index.html` exists, then launch `Start_EDITH.bat`.
-6. Verify wake display, state labels, response streaming, return to listening, sleep/hide, and clean close.
+6. Verify wake display, response streaming, sleep/hide, close-to-hide, and explicit `shutdown EDITH`.
 
 `npm run build` checks the Vite/React/CSS production compilation. It does not test microphone capture, WebView2 transparency, Python-to-JavaScript timing, real TTS amplitude, or multi-monitor placement.
 

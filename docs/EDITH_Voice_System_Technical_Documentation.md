@@ -40,9 +40,10 @@ responsibilities.
 ## Completed and tested at this checkpoint
 
 The user reported successful runtime tests for wake detection,
-first-turn capture, multiple conversation turns, short commands such as
-`Exit`, natural pauses, seven-second idle timeout, return to wake mode,
-post-TTS microphone cleanup and clean shutdown.
+first-turn capture, multiple conversation turns, natural pauses,
+seven-second idle timeout, return to wake mode, post-TTS microphone
+cleanup and clean shutdown. The lifecycle commands described below are
+the current behavior.
 
 This is evidence from the user's machine and tests, not a guarantee
 across every microphone, room or acoustic environment.
@@ -626,10 +627,12 @@ and sets `_conversation_active = True`.
 Further calls are permitted while `_conversation_active` remains true.
 This is the mechanism that allows multiple turns after one wake phrase.
 
-The exact spoken command `sleep` returns EDITH to wake-word mode without
-sending the command to the LLM. `return_to_wake_word_mode()` clears queued
-audio and resets the wake and endpoint detectors before the next
-`wait_for_wake_word()` call. EDITH then waits for `Hey EDITH`.
+The exact commands `sleep`, `stop`, `go to sleep`, and `exit` return EDITH
+to wake-word mode without sending the command to the LLM. The exact command
+`hibernate` does the same and additionally releases the cached Whisper model.
+`return_to_wake_word_mode()` clears queued audio and resets the wake and
+endpoint detectors before the next `wait_for_wake_word()` call. EDITH then
+waits for `Hey EDITH`.
 
 ## 11.4 Seven-second idle timeout
 
@@ -681,6 +684,21 @@ before changing timeout logic.
 `main.py` treats `None` as the end of the conversation and returns to
 wake-word mode.
 
+## 11.6 Hibernation and wake-word monitoring
+
+The application lifecycle controller starts in SLEEPING mode and measures
+inactivity with a monotonic clock. After
+`EDITH_HIBERNATE_AFTER_SECONDS` (default 300 seconds), it calls
+`VoiceEngine.hibernate()`. Hibernation closes only the Whisper model manager's
+cached model; it does not close the persistent microphone stream, wake-word
+adapter, Piper TTS, memory worker, or Ollama client. Whisper is loaded again
+through the model manager's existing lazy-load path when the next utterance
+needs transcription.
+
+The `hibernate` voice command can request the same transition immediately.
+If model release fails, the error is logged and EDITH returns to SLEEPING
+mode so the wake monitor remains available and the release can be retried.
+
 # 12. TTS and response orchestration
 
 ## 12.1 Existing Piper implementation
@@ -718,11 +736,18 @@ Only after both waits does it call `voice.prepare_for_next_turn()`.
 This ordering is essential. Cleanup must happen after Piper has
 completed playback.
 
-## 12.4 Exit command
+## 12.4 Lifecycle voice commands
 
-`is_exit_command()` case-folds text, strips punctuation and checks for
-the exact normalized word `exit`. It is handled before LLM generation.
-On exit, EDITH speaks "Goodbye." and the application shutdown path runs.
+Commands are normalized for case, punctuation, and repeated whitespace, and
+matched exactly before LLM generation:
+
+- `sleep`, `stop`, `go to sleep`, and `exit`: return to wake-word mode.
+- `hibernate`: return to wake-word mode and release the cached Whisper model.
+- `shutdown EDITH`: speak "Goodbye." and perform a full application shutdown.
+
+The default inactivity hibernation period is 300 seconds and is configurable
+with `EDITH_HIBERNATE_AFTER_SECONDS`. Only `shutdown EDITH` ends the process;
+closing the overlay hides it, and does not stop the voice engine.
 
 # 13. TTS self-transcription prevention
 
@@ -800,9 +825,9 @@ while app_is_running:
 
         user_text = result["text"]
 
-        if is_exit_command(user_text):
+        if is_shutdown_command(user_text):
             tts.speak("Goodbye.")
-            stop()
+            shutdown()
             break
 
         start_tts_worker()
@@ -891,8 +916,9 @@ pause were included in one transcript.
 -   CTranslate2 CUDA device visibility and FP16 support confirmed.
 -   Integrated wake-to-transcription test recognized a question.
 -   Integration suite reported `29 passed`.
--   Manual checks: `Exit.` passed; natural pause passed; repeated wake
-    passed; no audio overflow/drop in that run.
+-   Historical manual checks before lifecycle command changes: `Exit.`
+    passed; natural pause and repeated wake passed; no audio overflow/drop
+    in that run.
 
 ## 16.4 Continuous conversation
 
@@ -903,8 +929,8 @@ The user's runtime log showed:
 -   Further turns accepted without another wake phrase.
 -   Seven seconds of no speech caused sleep/return to wake mode.
 -   A later wake phrase was detected.
--   `Exit.` was recognized.
--   Shutdown completed.
+-   In the earlier command mapping, `Exit.` was recognized as shutdown.
+-   The current exact shutdown command is `shutdown EDITH`.
 
 ## 16.5 TTS cleanup
 
@@ -924,7 +950,11 @@ observed final-word self-transcription issue.
 -   [ ] More than seven seconds of silence returns to wake mode.
 -   [ ] EDITH's playback is not transcribed as user speech.
 -   [ ] A real question immediately after cleanup is captured.
--   [ ] `Exit.` works.
+-   [ ] `sleep`, `stop`, `go to sleep`, and `exit` return to wake-word mode.
+-   [ ] `hibernate` releases Whisper and a later wake reloads it on demand.
+-   [ ] Closing the overlay hides it without stopping EDITH.
+-   [ ] `shutdown EDITH` closes all services cleanly.
+-   [ ] A second launch is rejected without opening another microphone.
 -   [ ] Voice, TTS and memory worker close cleanly.
 -   [ ] No unexpected audio overflow/drop growth.
 
@@ -1100,8 +1130,9 @@ EDITH is ready — Local AI: Online
 
 Continuous Conversation Mode enabled.
 Say 'Hey EDITH' to start.
-Say 'sleep' to wait for the wake word.
-Say 'exit' to stop.
+Say 'sleep', 'stop', 'go to sleep', or 'exit' to wait.
+Say 'hibernate' to release the Whisper model.
+Say 'shutdown EDITH' to stop.
 
 [READY] Waiting for wake word...
 ```
@@ -1117,8 +1148,9 @@ Smoke test:
 7.  Say "Hey EDITH" again.
 8.  Say "sleep" during a conversation and confirm wake-word mode resumes.
 9.  Say "Hey EDITH" again.
-10. Say "Exit."
-11. Confirm clean shutdown.
+10. Say "hibernate" and confirm wake-word monitoring remains available.
+11. Say "Hey EDITH" and confirm the Whisper model reloads on transcription.
+12. Say "shutdown EDITH" and confirm clean shutdown.
 
 Test suite:
 

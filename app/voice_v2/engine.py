@@ -59,6 +59,7 @@ class VoiceEngine:
         wait_for_wake_word()
         listen()
         prepare_for_next_turn()
+        hibernate()
         close()
 
     Only one microphone stream is used.
@@ -403,6 +404,24 @@ class VoiceEngine:
         wake_adapter.reset()
         self._wake_detected = False
         self._conversation_active = False
+
+    def hibernate(self) -> None:
+        """Release the cached STT model while preserving wake-word monitoring."""
+
+        if self._closed:
+            raise RuntimeError("VoiceEngine is closed")
+
+        if self._conversation_active or self._wake_detected:
+            raise RuntimeError(
+                "VoiceEngine must be idle before hibernation"
+            )
+
+        if self._stt is not None:
+            self._stt.close()
+
+        logger.info(
+            "Whisper model cache released; microphone and wake monitor remain active"
+        )
 
     # --------------------------------------------------
     # STATUS
